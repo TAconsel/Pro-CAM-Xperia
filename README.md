@@ -174,6 +174,30 @@ The viewfinder says `PREVIEW SIMULATED` while that is happening.
 
 ---
 
+## Influences
+
+The viewfinder layout owes a clear debt to Sony's Photo Pro on Xperia phones: a
+landscape deck of one-touch controls, a scrubber for whichever parameter is
+selected, and a readout strip along the bottom. That arrangement is a good
+answer to the problem of putting camera controls on a touchscreen, and this
+project borrows the idea openly.
+
+What it does not borrow is anything of Sony's to borrow. Every line of code here
+is written against the Android Camera2 API; no Sony code was decompiled or
+consulted, and no Sony icons, fonts or assets are used — the interface is drawn
+with Compose Canvas primitives.
+
+The `P` / `S` / `M` mode naming is an industry convention that long predates any
+of this, and `MR` is the same idea as Canon's `C1`/`C2`/`C3` or Nikon's
+`U1`/`U2`.
+
+ProCam is not affiliated with, endorsed by, or connected to Sony Group
+Corporation in any way. Sony, Xperia, Photo Pro and Cinema Pro are trademarks of
+their respective owners and are used here only to describe what inspired this
+project.
+
+---
+
 ## Licence
 
 ProCam is free software, licensed under the
