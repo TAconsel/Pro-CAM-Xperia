@@ -6,6 +6,20 @@ Manual camera app for the **Nothing Phone (2a) Plus** (`A142P`), built on Camera
 Free software under the **GNU GPL v3 or later** — see [Licence](#licence).
 Prebuilt debug APKs are attached to the [Releases](../../releases) page.
 
+![ProCam viewfinder](docs/viewfinder.webp)
+
+The viewfinder is landscape-only and laid out like a camera body rather than a
+phone app. Amber always marks the one value the ruler is currently driving.
+
+- **Left rail** — diagnostics, camera selector, the `P S M MR` mode dial, and
+  the lens block (which doubles as the per-device preview-rotation control).
+- **Centre** — live preview with the histogram, and a readout strip along the
+  bottom: mode, shutter, aperture, exposure compensation, ISO, focus.
+- **Right deck** — the adjustment ruler on top, then `AF-ON` / `AWB`, then one
+  button per control. Long-pressing `PEAK`, `ZEBRA` or `HIST` opens that
+  overlay's fine adjustment on the ruler.
+
+
 ---
 
 ## Measured hardware facts
