@@ -12,10 +12,12 @@ package com.procam
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.OrientationEventListener
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -63,6 +65,9 @@ class MainActivity : ComponentActivity() {
 
     private var orientationListener: OrientationEventListener? = null
 
+    /** The same instance Compose's viewModel() hands the screens. */
+    private val cameraVm: CameraViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -72,6 +77,7 @@ class MainActivity : ComponentActivity() {
         window.attributes.layoutInDisplayCutoutMode =
             WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         hideSystemBars()
+        requestFastestDisplayMode()
 
         // MainActivity is exported (it is the launcher), so any installed app
         // could fire this extra and make the camera open and write files on its
@@ -158,6 +164,51 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    // The two-stage shutter key. Both halves are consumed whatever the screen,
+    // so pressing it inside the app never hands control to the system camera.
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_FOCUS -> {
+                if (event.repeatCount == 0) cameraVm.onShutterHalfPress()
+                return true
+            }
+            KeyEvent.KEYCODE_CAMERA -> {
+                if (event.repeatCount == 0) cameraVm.onShutterFullPress()
+                return true
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_FOCUS -> {
+                cameraVm.onShutterHalfRelease()
+                return true
+            }
+            KeyEvent.KEYCODE_CAMERA -> return true
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
+    /**
+     * A viewfinder frame waits about 1.5 display refreshes between the GPU and
+     * the glass, so a 120 Hz panel shows it ~12 ms sooner than at 60 Hz. This
+     * is only a request: the system's own refresh-rate cap outranks it, and on
+     * the Xperia 1 VII at its default 60 Hz setting the display stays at 60.
+     */
+    private fun requestFastestDisplayMode() {
+        val d = display ?: return
+        val current = d.mode
+        val fastest = d.supportedModes
+            .filter {
+                it.physicalWidth == current.physicalWidth &&
+                    it.physicalHeight == current.physicalHeight
+            }
+            .maxByOrNull { it.refreshRate } ?: return
+        window.attributes = window.attributes.also { it.preferredDisplayModeId = fastest.modeId }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

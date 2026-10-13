@@ -1,6 +1,7 @@
 # ProCam
 
-Manual camera app for the **Nothing Phone (2a) Plus** (`A142P`), built on Camera2
+Manual camera app for the **Nothing Phone (2a) Plus** (`A142P`) and the **Sony
+Xperia 1 VII** (`XQ-FS72`), built on Camera2
 + Jetpack Compose, with a DSLR-style landscape viewfinder.
 
 Free software under the **GNU GPL v3 or later** — see [Licence](#licence).
@@ -49,6 +50,39 @@ ultra-wide from a third-party app.
 50 MP is likewise out of reach: `8160×6144` appears only under
 `availableStreamConfigurationsMaximumResolution` and a `nothing.scaler.*` vendor
 tag, while the camera does **not** advertise `ULTRA_HIGH_RESOLUTION_SENSOR`.
+
+### Sony Xperia 1 VII (`XQ-FS72`)
+
+Measured on Android 16, build `71.1.A.2.265`. Unlike the Nothing, **every
+camera is open to third-party apps**, so the ultra-wide and the telephoto are
+reachable from the `CAM` button. The lens block shows the 35 mm equivalent.
+
+| camera | lens | level | ISO | longest exposure | RAW |
+|---|---|---|---|---|---|
+| `"0"` | logical back (main + 2/3/4) | `FULL` | 25 – 3200 | 1 s | 4000×3000 |
+| `"1"` | front, 24 mm eq, fixed focus | `FULL` | 64 – 3200 | 1/4 s | 4000×3000 |
+| `"2"` | main, 24 mm eq, f/1.9 | `FULL` | 25 – 3200 | 1 s | 4000×3000 |
+| `"3"` | telephoto, 89 mm eq, f/2.4 | `LIMITED` | 32 – 2000 | 1/10 s | 4000×3000 |
+| `"4"` | ultra-wide, 16 mm eq, f/2.0 | `FULL` | 50 – 3200 | 1/10 s | 4000×3000 |
+
+All five accept `preview + YUV640 + JPEG + RAW`. CFA is `RGGB` on the main and
+ultra-wide; sensor orientation is 90 on the back, 270 on the front. The preview
+needs the same `+90` rotation correction as the Nothing, on every camera; it is
+built in for this model.
+
+**Long exposures stop at 1 s.** Sony publishes 30 s under the vendor tag
+`com.sonymobile.sensor.info.exposureTimeRange`, which is what Photo Pro offers,
+but the HAL validates `SENSOR_EXPOSURE_TIME` against the public range and fails
+the whole device (`ERROR_CAMERA_DEVICE`) for anything longer:
+
+```
+camera-hal: validateCaptureSettings: Unsupported sensor exposure time value 4000000000 range (100000, 1000000000).
+```
+
+None of Sony's request or session vendor keys (`aeMode` 0–14, `usecase`,
+`exposureTimeLimit`, `exposureTimeHint`, `highQualitySnapshotMode`,
+`multiFrameNrMode`, `logicalMultiCamera.mode`) lifts that limit for a
+third-party client, so the app keeps to the public range.
 
 ### Verified on device
 
@@ -122,6 +156,15 @@ haptic ticks and eases onto the nearest value when you let go.
 | `FMT` | RAW+JPEG ↔ JPEG | — |
 | `GPS` | GPS tagging (off by default) | — |
 | `MR` | recall the stored setup | store the current setup |
+| `VF` | viewfinder `60P ↔ 30P` (auto exposure only) | — |
+
+**Hardware shutter key** (Xperia and other phones with a two-stage camera
+key) — half-press runs one AF cycle on the last tapped point, or the centre,
+and holds focus while the key is held; the reticle turns green on lock. Full
+press shoots. A quick full press waits up to 1.5 s for that AF cycle to lock
+first, so it is not shot with a moving lens. In manual focus the half-press
+does nothing and the full press just shoots. Both keys are kept by the app, so
+pressing them never opens the system camera.
 
 **Preview** — tap to place the AF point; the reticle turns green on lock, red on
 failure. Tap the histogram to switch luma/RGB.
@@ -137,6 +180,29 @@ failure. Tap the histogram to switch luma/RGB.
 
 Switching out of P carries the metered ISO and shutter over, so the image does
 not jump.
+
+### Viewfinder latency
+
+`VF 60P` (the default) runs auto exposure at the camera's fixed 60 fps range.
+Measured on the Xperia 1 VII, from the frame's sensor timestamp to the glass:
+
+| stage | 30 fps | 60 fps |
+|---|---|---|
+| camera HAL, sensor → frame handed to the app | ~75 ms | ~75 ms |
+| ProCam, frame → drawn (GL shader incl. peaking) | 0.5 ms | 0.5 ms |
+| SurfaceFlinger, posted → on screen (60 Hz panel) | ~23 ms | ~25 ms |
+| exposure + time each frame stays up | ~33 ms | ~17 ms |
+
+The HAL's ~75 ms does not move for frame rate, preview size, the stream set
+(RAW and JPEG or not), logical or physical camera, the PREVIEW stream use case,
+noise-reduction mode or any of Sony's vendor modes, so 60 fps is what an app
+can win: about 15 ms fresher on average, and smooth motion. The price is that
+auto exposure stops at 1/60 s and raises ISO instead; `30P` gives P mode the
+1/30 s back for dim scenes. S and M set their own frame time.
+
+The app also asks for the panel's fastest mode (120 Hz), which would take
+another ~12 ms off, but the system refresh-rate cap outranks app requests and
+at the phone's default setting the display stays at 60 Hz.
 
 ### Long exposures
 
@@ -168,7 +234,8 @@ The viewfinder says `PREVIEW SIMULATED` while that is happening.
   `ROTATION_90`. If the preview is upside down when the phone is held the other
   way, tap the lens block to correct it and the formula needs the display term
   sign flipped.
-- Front camera is untested; it is fixed-focus and tops out at a square JPEG.
+- Front camera is untested on the Nothing; it is fixed-focus and tops out at a
+  square JPEG. On the Xperia it works, mirrored, at the same `+90` correction.
 - No video.
 - Release build has no signing config and no shrinking.
 

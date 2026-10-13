@@ -50,6 +50,7 @@ class PreviewRotationStore(context: Context) {
          */
         val MEASURED = mapOf(
             "A142P" to 90, // Nothing Phone (2a) Plus
+            "XQ-FS72" to 90, // Sony Xperia 1 VII — every camera, front included
         )
     }
 }

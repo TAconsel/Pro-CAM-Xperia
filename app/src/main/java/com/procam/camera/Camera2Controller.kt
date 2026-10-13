@@ -423,8 +423,7 @@ class Camera2Controller(context: Context) {
 
     /** @param sensorX/@param sensorY normalised point in the sensor's own frame. */
     fun focusAt(sensorX: Float, sensorY: Float) {
-        val dev = device ?: return
-        val s = session ?: return
+        if (device == null || session == null) return
         if (capabilities.maxAfRegions <= 0) return
 
         val arr = capabilities.activeArraySize
@@ -446,6 +445,32 @@ class Camera2Controller(context: Context) {
 
         // repeating request first, so the new region is what the trigger acts on
         startPreview()
+        triggerAfCycle()
+    }
+
+    /** True while an AF region is set, from a tap or a half-press. */
+    fun hasFocusRegion(): Boolean = afRegions != null
+
+    /**
+     * Half-press of a two-stage shutter key: one AF cycle that then holds,
+     * like AF-S on a camera body. It reuses the region from the last tap so a
+     * half-press refocuses on the chosen subject; with none it focuses on the
+     * centre. In AF_MODE_AUTO the lens stays put after the cycle until the
+     * region is cleared, which is what makes the lock last until the shot.
+     *
+     * It is a real AF cycle on purpose. Pinning wherever continuous AF had
+     * got to is faster, but continuous AF is not always right — closer than
+     * the rated minimum focus it reports PASSIVE_FOCUSED while blurred — and
+     * on the Xperia 1 VII a still captured while CONTINUOUS_PICTURE is
+     * trigger-locked never returns a result and stalls the preview for good.
+     */
+    fun halfPressFocus() {
+        if (afRegions == null) focusAt(0.5f, 0.5f) else triggerAfCycle()
+    }
+
+    private fun triggerAfCycle() {
+        val dev = device ?: return
+        val s = session ?: return
 
         fun trigger(value: Int) = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
             previewSurface?.let { addTarget(it) }
@@ -549,6 +574,10 @@ class Camera2Controller(context: Context) {
             jpegReader?.surface?.let { builder.addTarget(it) }
             if (useRaw) rawReader?.surface?.let { builder.addTarget(it) }
             builder.applyControls(controls, capabilities, previewCap = null)
+            // Without the region the still request goes back to
+            // CONTINUOUS_PICTURE, and the lens can leave the focus that a tap
+            // or half-press just locked.
+            builder.applyRegions()
             builder.applyStillFlash(controls, capabilities)
             builder.set(CaptureRequest.JPEG_QUALITY, 100.toByte())
             builder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)

@@ -50,6 +50,7 @@ class MemoryRecallStore(context: Context) {
             putBoolean("gridEnabled", s.gridEnabled)
             putBoolean("levelEnabled", s.levelEnabled)
             putBoolean("rawEnabled", s.rawEnabled)
+            putBoolean("fastViewfinder", s.fastViewfinder)
             putBoolean("gpsEnabled", s.gpsEnabled)
         }.apply()
     }
@@ -79,6 +80,7 @@ class MemoryRecallStore(context: Context) {
             gridEnabled = prefs.getBoolean("gridEnabled", d.gridEnabled),
             levelEnabled = prefs.getBoolean("levelEnabled", d.levelEnabled),
             rawEnabled = prefs.getBoolean("rawEnabled", d.rawEnabled),
+            fastViewfinder = prefs.getBoolean("fastViewfinder", d.fastViewfinder),
             gpsEnabled = prefs.getBoolean("gpsEnabled", d.gpsEnabled),
         )
         val mode = runCatching {

@@ -136,6 +136,7 @@ fun CameraScreen(
                     vm = vm,
                     mode = ui.mode,
                     focalMm = ui.caps?.focalLengthMm ?: 0f,
+                    equivalentMm = ui.caps?.equivalentFocalMm,
                     rotationOffset = ui.previewRotationOffset,
                     cameraId = ui.caps?.cameraId ?: "-",
                     cameraCount = ui.cameras.size,
@@ -194,6 +195,7 @@ fun CameraScreen(
                                 }
                             },
                             update = { v ->
+                                v.previewRenderer.bufferSize = caps.previewSize
                                 v.previewRenderer.overlay = overlay
                                 v.previewRenderer.rotationDegrees = rotation
                                 v.previewRenderer.mirror = !caps.facingBack
@@ -277,6 +279,7 @@ private fun LeftRail(
     vm: CameraViewModel,
     mode: ShootMode,
     focalMm: Float,
+    equivalentMm: Int?,
     rotationOffset: Int,
     cameraId: String,
     cameraCount: Int,
@@ -321,7 +324,13 @@ private fun LeftRail(
             modifier = Modifier.clickable { vm.cyclePreviewRotation() },
         ) {
             Text2("Lens", ProTheme.TextDim, 9.sp)
-            Text2("${focalMm.toInt()}mm", ProTheme.TextPrimary, 11.sp)
+            // The 35 mm equivalent is what tells the lenses apart; the real
+            // focal length of a phone lens is a few millimetres for all of them.
+            Text2(
+                if (equivalentMm != null) "${equivalentMm}mm" else "${focalMm.toInt()}mm",
+                ProTheme.TextPrimary,
+                11.sp,
+            )
             Text2(
                 "ROT ${if (rotationOffset == 0) "0" else "+$rotationOffset"}",
                 if (rotationOffset == 0) ProTheme.TextDim else ProTheme.Accent,
@@ -660,6 +669,17 @@ private fun ControlDeck(
                 selected = ui.mode == ShootMode.MR, enabled = on, modifier = cell,
                 onLongClick = { vm.saveMemoryRecall() },
             ) { vm.setMode(ShootMode.MR) }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = gap) {
+            val fast = c.fastViewfinder && caps?.fastPreviewFps != null
+            DeckButton(
+                "VF", if (fast) "${caps?.fastPreviewFps?.upper}P" else "30P",
+                selected = fast,
+                enabled = on && caps?.fastPreviewFps != null,
+                modifier = cell,
+            ) { vm.toggleFastViewfinder() }
+            Spacer(cell)
+            Spacer(cell)
         }
 
         ui.notice?.let {

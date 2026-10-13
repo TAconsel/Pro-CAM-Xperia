@@ -42,10 +42,18 @@ import com.procam.gl.OverlaySettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 private const val TAG = "ProCam.VM"
+
+/** Longest a full press waits for the AF cycle its half-press started. */
+private const val AF_SETTLE_MS = 1_500L
+
+/** How long a fresh AF cycle may take to show up in the results. */
+private const val AF_START_MS = 300L
 
 enum class ShootMode { P, S, M, MR }
 
@@ -105,6 +113,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     private val mrStore = MemoryRecallStore(app)
     private val rotationStore = PreviewRotationStore(app)
     private var previewSurface: Surface? = null
+    private var previewTexture: SurfaceTexture? = null
     private var openJob: kotlinx.coroutines.Job? = null
     private var sessionJob: kotlinx.coroutines.Job? = null
     private var lastServoAt = 0L
@@ -176,6 +185,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         val surface = Surface(st)
         if (previewSurface !== surface) previewSurface?.release()
         previewSurface = surface
+        previewTexture = st
         restartSession(surface)
     }
 
@@ -238,6 +248,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         controller.close()
         previewSurface?.release()
         previewSurface = null
+        previewTexture = null
         _ui.value = _ui.value.copy(ready = false, caps = null, plan = null, opening = true)
     }
 
@@ -500,6 +511,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
         val (sx, sy) = displayToSensor(nx, ny, previewRotation, mirrored)
         controller.focusAt(sx, sy)
+        lastTapPoint = nx to ny
         _ui.value = _ui.value.copy(
             focusPoint = FocusPoint(nx, ny, android.os.SystemClock.uptimeMillis()),
         )
@@ -598,6 +610,23 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         _ui.value.controls.let { it.copy(histogramEnabled = !it.histogramEnabled) },
     )
 
+    fun toggleFastViewfinder() {
+        val caps = _ui.value.caps ?: return
+        if (caps.fastPreviewFps == null) {
+            _ui.value = _ui.value.copy(notice = "camera ${caps.cameraId} has no 60 fps mode")
+            return
+        }
+        val next = !_ui.value.controls.fastViewfinder
+        push(_ui.value.controls.copy(fastViewfinder = next))
+        _ui.value = _ui.value.copy(
+            notice = if (next) {
+                "60 fps viewfinder — auto exposure stops at 1/60 s"
+            } else {
+                "30 fps viewfinder — auto exposure can use 1/30 s"
+            },
+        )
+    }
+
     fun toggleRawEnabled() {
         val caps = _ui.value.caps ?: return
         if (!caps.supportsRaw) {
@@ -641,13 +670,23 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         openJob?.cancel(); openJob = null
         controller.close()
         histogram.reset()
-        _ui.value = _ui.value.copy(ready = false, caps = null, plan = null, notice = null)
+        // caps is deliberately left in place until the new camera is open. The
+        // viewfinder only exists while caps is set, and tearing it down here
+        // abandons its SurfaceTexture: the restart below then fails with
+        // "Surface was abandoned", and a GLSurfaceView created in its place
+        // never gets a window surface (seen on Xperia 1 VII). Keeping the one
+        // view lets the new camera render into the same, still-valid surface.
+        _ui.value = _ui.value.copy(ready = false, plan = null, notice = null)
 
         openJob = viewModelScope.launch {
             try {
                 controller.open(next.cameraId)
                 _ui.value = _ui.value.copy(caps = controller.capabilities, cameras = cams)
                 applyDefaultsFor(controller.capabilities)
+                // The session sizes the preview stream from the surface, so the
+                // new camera's preview size has to be on it first.
+                val size = controller.capabilities.previewSize
+                previewTexture?.setDefaultBufferSize(size.width, size.height)
                 previewSurface?.let { restartSession(it) }
             } catch (t: Throwable) {
                 Log.e(TAG, "switchCamera failed", t)
@@ -706,6 +745,93 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------
+    // hardware shutter key
+    //
+    // Xperias have a two-stage key: half-press sends KEYCODE_FOCUS, full
+    // press KEYCODE_CAMERA while FOCUS is still held. It behaves the way a
+    // camera body does: half-press focuses and holds, full press shoots.
+    // ------------------------------------------------------------------
+
+    private var halfPressed = false
+
+    /** Focusing that the half-press started; a full press waits for it. */
+    private var halfPressJob: kotlinx.coroutines.Job? = null
+
+    /** Where the last tap-to-focus landed, as a fraction of the preview. */
+    private var lastTapPoint: Pair<Float, Float>? = null
+
+    /** Set when the half-press, not a tap, put the AF box down. */
+    private var halfPressMadeRegion = false
+
+    fun onShutterHalfPress() {
+        if (halfPressed) return
+        halfPressed = true
+
+        val ui = _ui.value
+        val caps = ui.caps ?: return
+        if (ui.locked || !ui.ready) return
+        if (ui.controls.focusMode != ControlMode.AUTO || caps.maxAfRegions <= 0) return
+
+        halfPressMadeRegion = !controller.hasFocusRegion()
+        Log.i(TAG, "shutter key: half-press, AF on ${if (halfPressMadeRegion) "centre" else "tapped point"}")
+        val (x, y) = if (halfPressMadeRegion) 0.5f to 0.5f else lastTapPoint ?: (0.5f to 0.5f)
+        _ui.value = ui.copy(focusPoint = FocusPoint(x, y, android.os.SystemClock.uptimeMillis()))
+
+        controller.halfPressFocus()
+        halfPressJob = viewModelScope.launch {
+            withTimeoutOrNull(AF_SETTLE_MS) {
+                // Results already in flight still carry the previous cycle's
+                // lock; wait for this cycle to start before trusting a lock.
+                withTimeoutOrNull(AF_START_MS) {
+                    _ui.first { it.afState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN }
+                }
+                _ui.first {
+                    it.afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                        it.afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
+                }
+            }
+        }
+    }
+
+    fun onShutterHalfRelease() {
+        if (!halfPressed) return
+        halfPressed = false
+        // The focusing job is left to finish: a quick full press lifts FOCUS
+        // before focus has landed, and that shot is still waiting on it.
+        halfPressJob = null
+        if (!halfPressMadeRegion) return // a tapped subject stays chosen
+        halfPressMadeRegion = false
+        // Back to continuous AF — but not in the middle of a shot, where
+        // restarting the preview would race the still request.
+        viewModelScope.launch {
+            _ui.first { !it.busy }
+            if (!halfPressed) {
+                controller.clearFocusRegion()
+                _ui.value = _ui.value.copy(focusPoint = null)
+            }
+        }
+    }
+
+    fun onShutterFullPress() {
+        val ui = _ui.value
+        if (ui.locked || !ui.ready || ui.busy) return
+        val focusing = halfPressJob
+        viewModelScope.launch {
+            // A quick full press lands a few milliseconds after FOCUS: let the
+            // focusing it started finish rather than shoot a moving lens.
+            val waited = android.os.SystemClock.uptimeMillis()
+            focusing?.join()
+            Log.i(
+                TAG,
+                "shutter key: full press, shooting after " +
+                    "${android.os.SystemClock.uptimeMillis() - waited}ms, " +
+                    "afState=${_ui.value.afState}",
+            )
+            capture()
+        }
+    }
+
+    // ------------------------------------------------------------------
     // capture
     // ------------------------------------------------------------------
 
@@ -723,6 +849,13 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 Log.e(TAG, "capture error: ${shot.error}")
                 shot.rawImage?.close()
                 _ui.value = _ui.value.copy(busy = false, notice = shot.error)
+                // A request the HAL never answered can leave the pipeline
+                // stalled with a frozen viewfinder; reopening is the only
+                // reliable way back.
+                if (shot.error.startsWith("no ")) {
+                    onEnterBackground()
+                    onEnterForeground()
+                }
                 return@launch
             }
 

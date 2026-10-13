@@ -60,6 +60,17 @@ data class ManualControlState(
     val rawEnabled: Boolean = true,
 
     /**
+     * Run auto exposure at the camera's fixed 60 fps range. The camera's own
+     * processing delay is the same at any frame rate (~75 ms on the Xperia 1
+     * VII), but at 60 fps each frame is exposed for half as long and replaced
+     * twice as often, so the viewfinder trails the scene by about 15 ms less
+     * and moves smoothly. The cost is that auto exposure cannot go past
+     * 1/60 s and raises ISO instead, so P-mode shots in dim light are
+     * noisier; 30P puts the 1/30 s back. S and M set their own frame time.
+     */
+    val fastViewfinder: Boolean = true,
+
+    /**
      * Off by default on purpose: once a GPS tag is in the file it travels with
      * every copy you share, and a camera app should not make that decision for
      * you.
@@ -122,6 +133,12 @@ fun CaptureRequest.Builder.applyControls(
     } else {
         set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         set(CaptureRequest.CONTROL_AE_LOCK, false)
+        // Set on the still request as well as the preview: the frame-rate
+        // range is a session key, and a still asking for a different one can
+        // make the HAL rebuild its pipeline in the middle of the shot.
+        if (s.fastViewfinder) {
+            caps.fastPreviewFps?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+        }
         set(
             CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
             s.evSteps.coerceIn(caps.evRange.lower, caps.evRange.upper),

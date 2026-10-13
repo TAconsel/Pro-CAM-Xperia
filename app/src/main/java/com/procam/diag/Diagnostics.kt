@@ -68,6 +68,18 @@ class Diagnostics(private val context: Context) {
             log(c.summary())
         }
 
+        // Being listed is not the same as being openable: some OEMs list
+        // physical cameras that then refuse a third-party client.
+        log("")
+        log("open test   :")
+        for (c in cameras) {
+            val probe = Camera2Controller(context)
+            val outcome = runCatching { probe.open(c.cameraId) }
+                .fold({ "opens" }, { "REFUSED (${it.message})" })
+            probe.release()
+            log("  camera \"${c.cameraId}\" ${outcome}")
+        }
+
         val target = cameras.firstOrNull { it.facingBack && it.supportsRaw }
             ?: cameras.firstOrNull { it.facingBack }
             ?: cameras.firstOrNull()
@@ -122,8 +134,10 @@ class Diagnostics(private val context: Context) {
                 16_000_000_000L,
                 32_000_000_000L,
             ).filter { it <= target.exposureTimeRange.upper }
+                .let { l -> if (target.exposureTimeRange.upper in l) l else l + target.exposureTimeRange.upper }
 
             var firstClamp: Long? = null
+            var firstError: Long? = null
 
             for (requested in ladder) {
                 controller.updateControls(
@@ -149,6 +163,7 @@ class Diagnostics(private val context: Context) {
                     else -> "CLAMPED"
                 }
                 if (verdict == "CLAMPED" && firstClamp == null) firstClamp = requested
+                if (shot.error != null && firstError == null) firstError = requested
 
                 log(
                     "%-10s %-14s %-14s %-9s %-8s".format(
@@ -162,7 +177,9 @@ class Diagnostics(private val context: Context) {
             }
 
             log("")
-            if (firstClamp == null) {
+            if (firstError != null) {
+                log("VERDICT: capture failed from ${formatShutter(firstError)} up — see the errors above.")
+            } else if (firstClamp == null) {
                 log("VERDICT: full ladder honoured — no frame stacking needed.")
             } else {
                 log("VERDICT: clamped from ${formatShutter(firstClamp)} up — stacking required above that.")

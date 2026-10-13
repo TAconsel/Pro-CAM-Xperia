@@ -38,6 +38,10 @@ data class CameraCapabilities(
     val evStep: Double,
     val aperture: Float,
     val focalLengthMm: Float,
+    /** 35 mm-equivalent focal length, or null when the sensor size is unknown. */
+    val equivalentFocalMm: Int?,
+    /** Fastest fixed AE frame-rate range at 60 fps or above, if the camera has one. */
+    val fastPreviewFps: Range<Int>?,
     val hasFlash: Boolean,
     val maxAfRegions: Int,
     val maxAeRegions: Int,
@@ -89,8 +93,9 @@ data class CameraCapabilities(
         appendLine("  minFocusDistance  : $minFocusDistance diopters (manualFocus=$supportsManualFocus)")
         appendLine("  focusCalibration  : ${focusCalibrationName(focusCalibration)}")
         appendLine("  ev                : ${evRange.lower}..${evRange.upper} step=$evStep  (+-${"%.1f".format(evRange.upper * evStep)} EV)")
-        appendLine("  aperture / focal  : f/$aperture  ${focalLengthMm}mm  flash=$hasFlash")
+        appendLine("  aperture / focal  : f/$aperture  ${focalLengthMm}mm (${equivalentFocalMm ?: "?"}mm eq)  flash=$hasFlash")
         appendLine("  metering regions  : af=$maxAfRegions ae=$maxAeRegions")
+        appendLine("  fast viewfinder   : ${fastPreviewFps ?: "none"}")
         appendLine("  sensorOrientation : $sensorOrientation")
         appendLine("  activeArray       : ${activeArraySize.width()}x${activeArraySize.height()}")
         appendLine("  raw  size         : ${rawSize?.let { "${it.width}x${it.height}" } ?: "NOT SUPPORTED"}")
@@ -154,6 +159,29 @@ data class CameraCapabilities(
                 ?: fallback
         }
 
+        /**
+         * Phones with several back cameras give each a bare focal length, and
+         * 3.79 / 6.08 / 10.3 mm on sensors of different sizes says nothing
+         * about which is the ultra-wide. Scaled to the 43.27 mm diagonal of a
+         * 35 mm frame it reads as the 16 / 24 / 85 mm everyone knows.
+         */
+        private fun equivalentFocal(c: CameraCharacteristics, focalMm: Float): Int? {
+            val phys = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return null
+            val pixels = c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+            val active = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            // The physical size covers the whole pixel array; only the active
+            // area is imaged.
+            val sx = if (pixels != null && active != null && pixels.width > 0) {
+                active.width().toFloat() / pixels.width
+            } else 1f
+            val sy = if (pixels != null && active != null && pixels.height > 0) {
+                active.height().toFloat() / pixels.height
+            } else 1f
+            val diag = kotlin.math.hypot(phys.width * sx, phys.height * sy)
+            if (diag <= 0f || focalMm <= 0f) return null
+            return kotlin.math.round(focalMm * 43.27f / diag).toInt()
+        }
+
         fun from(id: String, c: CameraCharacteristics): CameraCapabilities {
             val caps = (c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0))
                 .toList()
@@ -163,6 +191,9 @@ data class CameraCapabilities(
             val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG)
             val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888)
             val privSizes = map?.getOutputSizes(android.graphics.SurfaceTexture::class.java)
+
+            val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                ?.firstOrNull() ?: 0f
 
             return CameraCapabilities(
                 cameraId = id,
@@ -189,8 +220,11 @@ data class CameraCapabilities(
                     ?: 1.0,
                 aperture = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)
                     ?.firstOrNull() ?: 0f,
-                focalLengthMm = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                    ?.firstOrNull() ?: 0f,
+                focalLengthMm = focal,
+                equivalentFocalMm = equivalentFocal(c, focal),
+                fastPreviewFps = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                    ?.filter { it.lower == it.upper && it.upper >= 60 }
+                    ?.maxByOrNull { it.upper },
                 hasFlash = c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false,
                 maxAfRegions = c.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0,
                 maxAeRegions = c.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0,

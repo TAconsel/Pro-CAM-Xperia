@@ -118,7 +118,7 @@ void main() {
  * the very thing it is meant to help you judge.
  */
 class PreviewRenderer(
-    private val bufferSize: Size,
+    bufferSize: Size,
     private val onSurfaceTextureReady: (SurfaceTexture) -> Unit,
     private val requestRender: () -> Unit,
 ) : GLSurfaceView.Renderer {
@@ -132,6 +132,20 @@ class PreviewRenderer(
 
     @Volatile
     var mirror: Boolean = false
+
+    /**
+     * Camera output size. The view outlives a camera switch, so this follows
+     * the current camera — otherwise a SurfaceTexture rebuilt after a trip to
+     * the background would come back at the first camera's size. The view
+     * model resizes the live texture itself before restarting the session.
+     */
+    @Volatile
+    var bufferSize: Size = bufferSize
+        set(value) {
+            if (value == field) return
+            field = value
+            surfaceTexture?.setDefaultBufferSize(value.width, value.height)
+        }
 
     private var program = 0
     private var aPosition = 0
@@ -272,6 +286,7 @@ class PreviewRenderer(
         GLES20.glDisableVertexAttribArray(aPosition)
         GLES20.glDisableVertexAttribArray(aTexCoord)
     }
+
 
     fun releaseSurfaceTexture() {
         runCatching { surfaceTexture?.setOnFrameAvailableListener(null) }
