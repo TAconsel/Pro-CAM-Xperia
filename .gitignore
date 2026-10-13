@@ -1,0 +1,26 @@
+# Build output
+/app/build/
+/build/
+.gradle/
+.kotlin/
+
+# Local machine configuration — contains absolute SDK paths
+local.properties
+
+# Packaged binaries are published as GitHub release assets, not tracked here
+*.apk
+*.aab
+
+# Signing material must never be committed
+*.jks
+*.keystore
+keystore.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Lint / report output
+/app/lint-baseline.xml
+/app/reports/
