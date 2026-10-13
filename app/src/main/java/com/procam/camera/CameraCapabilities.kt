@@ -17,6 +17,18 @@ import android.hardware.camera2.CameraMetadata
 import android.util.Range
 import android.util.Size
 
+/** One choice on the RES button: a JPEG size and its aspect ratio. */
+data class PhotoSize(val key: String, val size: Size) {
+    val megapixels: Int get() = Math.round(size.width.toLong() * size.height / 1_000_000.0).toInt()
+
+    /** "12M 4:3", "9M 16:9" */
+    val label: String get() = "${megapixels}M $key"
+
+    companion object {
+        const val DEFAULT_KEY = "4:3"
+    }
+}
+
 /**
  * Everything the UI and request builder need, resolved once per camera.
  *
@@ -52,7 +64,14 @@ data class CameraCapabilities(
     val previewSize: Size,
     val analysisSize: Size,
     val availableAnalysisSizes: List<Size>,
+    /** RES choices, 4:3 first. Never empty. */
+    val photoSizes: List<PhotoSize>,
 ) {
+    fun photoSize(key: String): PhotoSize =
+        photoSizes.firstOrNull { it.key == key }
+            ?: photoSizes.firstOrNull { it.key == PhotoSize.DEFAULT_KEY }
+            ?: photoSizes.first()
+
     val supportsManualSensor: Boolean
         get() = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in capabilities
 
@@ -100,6 +119,7 @@ data class CameraCapabilities(
         appendLine("  activeArray       : ${activeArraySize.width()}x${activeArraySize.height()}")
         appendLine("  raw  size         : ${rawSize?.let { "${it.width}x${it.height}" } ?: "NOT SUPPORTED"}")
         appendLine("  jpeg size         : ${jpegSize?.let { "${it.width}x${it.height}" } ?: "-"}")
+        appendLine("  photo sizes       : ${photoSizes.joinToString { "${it.label} ${it.size.width}x${it.size.height}" }}")
         appendLine("  preview size      : ${previewSize.width}x${previewSize.height}")
         append("  analysis size     : ${analysisSize.width}x${analysisSize.height}")
     }
@@ -182,6 +202,28 @@ data class CameraCapabilities(
             return kotlin.math.round(focalMm * 43.27f / diag).toInt()
         }
 
+        private val PHOTO_ASPECTS = listOf("4:3" to 4f / 3f, "3:2" to 3f / 2f, "16:9" to 16f / 9f, "1:1" to 1f)
+
+        /**
+         * The largest JPEG in each common aspect ratio.
+         *
+         * The 48 MP main sensor's maximum-resolution mode is deliberately not
+         * offered. It captures, but on the Xperia 1 VII the camera HAL crashes
+         * a second after every maximum-resolution still — JPEG or RAW, preview
+         * running or paused — and takes the open camera down with it.
+         */
+        private fun photoSizes(jpegSizes: Array<Size>?): List<PhotoSize> {
+            val list = PHOTO_ASPECTS.mapNotNull { (key, ratio) ->
+                jpegSizes
+                    ?.filter { kotlin.math.abs(it.width.toFloat() / it.height - ratio) < 0.01f }
+                    ?.maxByOrNull { it.width.toLong() * it.height }
+                    ?.let { PhotoSize(key, it) }
+            }
+            return list.ifEmpty {
+                listOf(PhotoSize(PhotoSize.DEFAULT_KEY, jpegSizes?.maxByOrNull { it.width.toLong() * it.height } ?: DeviceProfile.JPEG_SIZE))
+            }
+        }
+
         fun from(id: String, c: CameraCharacteristics): CameraCapabilities {
             val caps = (c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0))
                 .toList()
@@ -236,6 +278,7 @@ data class CameraCapabilities(
                 previewSize = pickPreviewSize(privSizes ?: yuvSizes),
                 analysisSize = pickAnalysisSize(yuvSizes),
                 availableAnalysisSizes = yuvSizes?.filter { it.width <= 800 }?.toList() ?: emptyList(),
+                photoSizes = photoSizes(jpegSizes),
             )
         }
 

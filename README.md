@@ -14,9 +14,10 @@ phone app. Amber always marks the one value the ruler is currently driving.
 
 - **Left rail** — diagnostics, camera selector, the `P S M MR` mode dial, and
   the lens block (which doubles as the per-device preview-rotation control).
-- **Centre** — live preview with the histogram, and a readout strip along the
-  bottom: mode, shutter, aperture, exposure compensation, ISO, focus.
-- **Right deck** — the adjustment ruler on top, then `AF-ON` / `AWB`, then one
+- **Centre** — live preview with the histogram, a status bar above it and a
+  readout strip below it: mode, shutter, aperture, exposure compensation, ISO,
+  focus. Neither bar covers the image; the preview is sized to fit between them.
+- **Right deck** — the adjustment ruler on top, then `AF-C`/`AF-S` / `AWB`, then one
   button per control. Long-pressing `PEAK`, `ZEBRA` or `HIST` opens that
   overlay's fine adjustment on the ruler.
 
@@ -147,7 +148,8 @@ haptic ticks and eases onto the nearest value when you let go.
 | `SS` | switch to S and drive shutter | — |
 | `EV` | drive exposure compensation (auto-exposure modes only) | — |
 | `WB` / `TINT` | take manual white balance, drive Kelvin / tint | — |
-| `FOCUS` | manual focus (also turns peaking on) | — |
+| `AF-C` / `AF-S` | switch continuous ↔ single-shot AF; from manual focus, back to AF | — |
+| `FOCUS` | manual focus (peaking stays as set; turn it on with `PEAK`) | — |
 | `PEAK` | cycle `OFF → GRN → RED → WHT → OFF` | peaking-level ruler |
 | `ZEBRA` | toggle | zebra-IRE ruler |
 | `HIST` | toggle | switch luma ↔ RGB |
@@ -157,14 +159,58 @@ haptic ticks and eases onto the nearest value when you let go.
 | `GPS` | GPS tagging (off by default) | — |
 | `MR` | recall the stored setup | store the current setup |
 | `VF` | viewfinder `60P ↔ 30P` (auto exposure only) | — |
+| `RES` | photo size: `12M 4:3 → 11M 3:2 → 9M 16:9 → 9M 1:1` | — |
+| `HDR` | `UHDR` (Ultra HDR JPEG) ↔ `SDR` (plain JPEG) | — |
 
-**Hardware shutter key** (Xperia and other phones with a two-stage camera
-key) — half-press runs one AF cycle on the last tapped point, or the centre,
-and holds focus while the key is held; the reticle turns green on lock. Full
-press shoots. A quick full press waits up to 1.5 s for that AF cycle to lock
-first, so it is not shot with a moving lens. In manual focus the half-press
-does nothing and the full press just shoots. Both keys are kept by the app, so
-pressing them never opens the system camera.
+**Hardware shutter key** — the only shutter; there is no on-screen button.
+Half-press runs one AF cycle on the last tapped point, or the centre, and holds
+focus while the key is held; the reticle turns green on lock. Full press shoots.
+A quick full press waits up to 1.5 s for that AF cycle to lock first, so it is
+not shot with a moving lens. In manual focus the half-press does nothing and
+the full press just shoots. Both keys are kept by the app, so pressing them
+never opens the system camera. The readout strip shows `SAVING…` while a shot
+is being taken and written.
+
+**AF-C and AF-S** — in AF-C the lens focuses continuously and a half-press
+locks it. In AF-S the lens only moves for a half-press or a tap, and stays
+where that left it after you let go, like single-shot AF on a camera body.
+
+**Vibration** — a click when a half-press or tap AF cycle locks focus, two
+light ticks when it gives up, and the same short click when a shot has been
+saved, so the camera can be worked without looking at the screen. They play as touch
+feedback, so the system touch-vibration strength setting scales them.
+
+**RES and HDR** — `RES` picks the largest JPEG the camera makes in each
+aspect ratio; for anything but 4:3 the preview darkens what the crop will cut.
+RAW stays the full 4000×3000 sensor frame whatever `RES` says.
+
+`HDR` saves Ultra HDR: the ordinary SDR JPEG, untouched, plus a gain map that
+tells an HDR screen how much brighter each region may be shown. The gain map
+is built by ProCam from RAW, because the camera HAL will not do it for a
+third-party app — its own `JPEG_R` output has a gain map of flat zero unless
+the client is Sony's camera app (whose shots go through a 12-frame `HdrComp`
+merge that no request or session setting would enable here). It does this on
+every camera, physical lenses included. In `HDR` mode a shot is a two-frame
+burst: the normal frame (JPEG + RAW) and a RAW frame two stops darker. Where
+the normal RAW runs into white — a window, a lamp, the sky — the dark frame
+still holds the highlight, blended in gradually as the normal frame nears
+clipping, and RAW luminance over JPEG luminance, matched in the midtones, is
+the boost. The dark frame is sent as a preview-type request: as a still, the
+HAL hands back a buffered frame at the normal exposure while its metadata
+claims the dark settings. The exposure ratio between the two frames is
+therefore measured from the pixels, and a dark frame that is not actually
+darker is ignored. Shadows and midtones are left exactly
+as the SDR picture has them; the boost fades in above middle grey and is
+capped at three stops. The summary line shows how much range the shot got
+(`UHDR … +2.3EV`), or `(no HDR highlights)` when the scene had none. `HDR`
+needs the RAW stream, and works with `FMT JPEG` too (the RAW is then used and
+not saved).
+
+The 48 MP main sensor is not offered. Its maximum-resolution mode does
+capture, but the Xperia 1 VII's camera HAL crashes about a second after every
+such still — JPEG or RAW, preview running or paused — and takes the open
+camera with it. If the camera is lost for any reason while the app is in
+front, it reopens on its own two seconds later.
 
 **Preview** — tap to place the AF point; the reticle turns green on lock, red on
 failure. Tap the histogram to switch luma/RGB.

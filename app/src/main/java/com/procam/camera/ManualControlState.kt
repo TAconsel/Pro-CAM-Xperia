@@ -28,6 +28,13 @@ data class ManualControlState(
     val exposureTimeNs: Long = 16_666_666L, // 1/60 s
 
     val focusMode: ControlMode = ControlMode.AUTO,
+
+    /**
+     * AF-S: with auto focus on, the lens moves only for a half-press of the
+     * shutter key or a tap, and then stays put — like single-shot AF on a
+     * camera body. Off is AF-C, continuous.
+     */
+    val afSingle: Boolean = false,
     val focusDiopter: Float = 0f, // 0 = infinity
 
     val wbMode: ControlMode = ControlMode.AUTO,
@@ -58,6 +65,17 @@ data class ManualControlState(
     val levelEnabled: Boolean = false,
 
     val rawEnabled: Boolean = true,
+
+    /** RES choice — a [PhotoSize.key]; the session is rebuilt when it changes. */
+    val photoSizeKey: String = PhotoSize.DEFAULT_KEY,
+
+    /**
+     * Ultra HDR JPEG: the ordinary SDR JPEG plus a gain map built from the RAW
+     * frame (see [com.procam.capture.UltraHdr]), so HDR screens show the
+     * highlights the SDR tone curve held back and everything else shows the
+     * SDR picture. Off is a plain SDR JPEG. Needs a RAW stream.
+     */
+    val hdr: Boolean = false,
 
     /**
      * Run auto exposure at the camera's fixed 60 fps range. The camera's own
@@ -152,6 +170,9 @@ fun CaptureRequest.Builder.applyControls(
             CaptureRequest.LENS_FOCUS_DISTANCE,
             s.focusDiopter.coerceIn(0f, caps.minFocusDistance),
         )
+    } else if (s.afSingle) {
+        // AUTO without a trigger leaves the lens where the last cycle put it.
+        set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
     } else {
         set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
     }

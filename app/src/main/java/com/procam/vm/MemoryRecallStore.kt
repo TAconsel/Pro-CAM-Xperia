@@ -51,6 +51,9 @@ class MemoryRecallStore(context: Context) {
             putBoolean("levelEnabled", s.levelEnabled)
             putBoolean("rawEnabled", s.rawEnabled)
             putBoolean("fastViewfinder", s.fastViewfinder)
+            putBoolean("afSingle", s.afSingle)
+            putString("photoSizeKey", s.photoSizeKey)
+            putBoolean("hdr", s.hdr)
             putBoolean("gpsEnabled", s.gpsEnabled)
         }.apply()
     }
@@ -81,6 +84,9 @@ class MemoryRecallStore(context: Context) {
             levelEnabled = prefs.getBoolean("levelEnabled", d.levelEnabled),
             rawEnabled = prefs.getBoolean("rawEnabled", d.rawEnabled),
             fastViewfinder = prefs.getBoolean("fastViewfinder", d.fastViewfinder),
+            afSingle = prefs.getBoolean("afSingle", d.afSingle),
+            photoSizeKey = prefs.getString("photoSizeKey", d.photoSizeKey) ?: d.photoSizeKey,
+            hdr = prefs.getBoolean("hdr", d.hdr),
             gpsEnabled = prefs.getBoolean("gpsEnabled", d.gpsEnabled),
         )
         val mode = runCatching {

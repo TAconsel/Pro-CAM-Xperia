@@ -76,6 +76,36 @@ class HapticEngine(context: Context) {
         play(END_STOP_SCALE, major = true, durationMs = 18)
     }
 
+    /** AF found focus — the job a camera body's focus beep does. */
+    fun focusLocked() {
+        lastFiredAt = SystemClock.uptimeMillis()
+        play(MAJOR_SCALE, major = true, durationMs = 20)
+    }
+
+    /** AF gave up: two light ticks, so it cannot be taken for a lock. */
+    fun focusFailed() {
+        lastFiredAt = SystemClock.uptimeMillis()
+        val v = vibrator ?: return
+        runCatching {
+            when {
+                supportsTickPrimitive -> v.vibrate(
+                    VibrationEffect.startComposition()
+                        .addPrimitive(VibrationEffect.Composition.PRIMITIVE_TICK, 0.8f)
+                        .addPrimitive(VibrationEffect.Composition.PRIMITIVE_TICK, 0.8f, 90)
+                        .compose(),
+                )
+
+                else -> v.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 10, 90, 10), -1))
+            }
+        }
+    }
+
+    /** The shot is written: the same short click as a focus lock. */
+    fun saved() {
+        lastFiredAt = SystemClock.uptimeMillis()
+        play(MAJOR_SCALE, major = true, durationMs = 20)
+    }
+
     private fun play(scale: Float, major: Boolean, durationMs: Long = 0) {
         val v = vibrator ?: return
         runCatching {

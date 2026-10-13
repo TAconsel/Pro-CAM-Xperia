@@ -38,6 +38,7 @@ import com.procam.camera.diopterToSlider
 import com.procam.camera.formatShutter
 import com.procam.camera.sliderToDiopter
 import com.procam.capture.MediaWriter
+import com.procam.capture.UltraHdr
 import com.procam.gl.OverlaySettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -51,6 +52,16 @@ private const val TAG = "ProCam.VM"
 
 /** Longest a full press waits for the AF cycle its half-press started. */
 private const val AF_SETTLE_MS = 1_500L
+
+/**
+ * How much darker the HDR bracket's second frame is. Two stops leaves the
+ * shadows of the normal frame usable for matching and sees four times further
+ * into the highlights — a window or a lamp that clips at the normal exposure.
+ */
+private const val HDR_BRACKET_STOPS = 2
+
+/** Pause before reopening a camera that was lost while the app was in front. */
+private const val REOPEN_AFTER_LOSS_MS = 2_000L
 
 /** How long a fresh AF cycle may take to show up in the results. */
 private const val AF_START_MS = 300L
@@ -84,6 +95,14 @@ data class UiState(
     val liveFocus: Float? = null,
     val liveAperture: Float? = null,
     val afState: Int? = null,
+    /**
+     * Bumped each time an AF cycle (half-press or tap) finishes, for the
+     * haptic confirmation; [focusFeedbackOk] says whether it found focus.
+     */
+    val focusFeedbackSeq: Int = 0,
+    val focusFeedbackOk: Boolean = false,
+    /** Bumped each time a shot has been written, for the haptic cue. */
+    val savedSeq: Int = 0,
     val focusPoint: FocusPoint? = null,
 
     val busy: Boolean = false,
@@ -125,9 +144,18 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         )
 
         controller.onDeviceLost = { reason ->
-            // The framework handed our camera to someone else. Drop to a
-            // recoverable state rather than sitting on a dead handle.
-            _ui.value = _ui.value.copy(ready = false, notice = reason)
+            // The framework handed our camera to someone else, or the camera
+            // HAL itself died. Drop to a recoverable state rather than sitting
+            // on a dead handle, and if we are still in front, reopen once the
+            // HAL has had time to restart — it takes a second or two.
+            _ui.value = _ui.value.copy(ready = false, notice = "$reason — reopening")
+            viewModelScope.launch {
+                kotlinx.coroutines.delay(REOPEN_AFTER_LOSS_MS)
+                if (inForeground && !controller.isOpen()) {
+                    onEnterBackground()
+                    onEnterForeground()
+                }
+            }
         }
 
         controller.onAnalysisFrame = { image ->
@@ -145,6 +173,19 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                     liveAperture = r.get(CaptureResult.LENS_APERTURE),
                     afState = r.get(CaptureResult.CONTROL_AF_STATE),
                 )
+                // Continuous AF settles quietly; only a cycle that was asked
+                // for — half-press or tap — ends in a scan-to-lock transition.
+                val af = r.get(CaptureResult.CONTROL_AF_STATE)
+                if (lastAfState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN &&
+                    (af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                        af == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED)
+                ) {
+                    _ui.value = _ui.value.copy(
+                        focusFeedbackSeq = _ui.value.focusFeedbackSeq + 1,
+                        focusFeedbackOk = af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED,
+                    )
+                }
+                lastAfState = af
             }
         }
     }
@@ -158,7 +199,10 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         openJob = viewModelScope.launch {
             try {
                 val cameras = controller.availableCameras()
-                val id = controller.bestCameraId()
+                // Coming back from the background or a lost camera, keep the
+                // lens that was in use rather than jumping back to the default.
+                val id = _ui.value.caps?.cameraId?.takeIf { c -> cameras.any { it.cameraId == c } }
+                    ?: controller.bestCameraId()
                 controller.open(id)
                 _ui.value = _ui.value.copy(
                     opening = false,
@@ -229,7 +273,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     // revoke it at any moment and hand back a disconnected CameraDevice.
     // ------------------------------------------------------------------
 
+    /** True between ON_RESUME and ON_PAUSE. */
+    private var inForeground = false
+
     fun onEnterBackground() {
+        inForeground = false
         sessionJob?.cancel(); sessionJob = null
         openJob?.cancel(); openJob = null
         controller.close()
@@ -238,6 +286,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun onEnterForeground() {
+        inForeground = true
         openCamera()
         // If the EGL context survived, no new SurfaceTexture is coming and the
         // existing surface has to be re-attached by hand.
@@ -293,12 +342,20 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------------
 
     private fun push(next: ManualControlState) {
+        val prev = _ui.value.controls
         _ui.value = _ui.value.copy(
             controls = next,
             previewSimulated = next.exposureMode == ControlMode.MANUAL &&
                 next.exposureTimeNs > DeviceProfile.PREVIEW_EXPOSURE_CAP_NS,
         )
         controller.updateControls(next)
+        // RES changes the still stream itself — from the button or an MR
+        // recall — so a running session has to be rebuilt around it.
+        if (prev.photoSizeKey != next.photoSizeKey &&
+            _ui.value.plan != null
+        ) {
+            rebuildSession()
+        }
         _overlay.value = OverlaySettings(
             peakingEnabled = next.peakingEnabled,
             peakingThreshold = next.peakingThreshold,
@@ -454,14 +511,13 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             setScrubTarget(ScrubTarget.FOCUS)
             return
         }
-        // Pick up wherever AF had landed so the image does not snap, and turn
-        // peaking on: manual focus on a phone screen is guesswork without it.
+        // Pick up wherever AF had landed so the image does not snap. Peaking
+        // is left as it was — PEAK turns it on when it is wanted.
         val live = _ui.value.liveFocus ?: c.focusDiopter
         push(
             c.copy(
                 focusMode = ControlMode.MANUAL,
                 focusDiopter = live.coerceIn(0f, caps.minFocusDistance),
-                peakingEnabled = true,
             ),
         )
         // an AF box means nothing once the lens is driven by hand
@@ -557,16 +613,30 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         return diopterToSlider(_ui.value.controls.focusDiopter, maxD)
     }
 
+    /**
+     * The AF button: from manual focus it goes back to auto focus, and in
+     * auto focus it switches between AF-C and AF-S. Manual focus itself is
+     * the FOCUS button.
+     */
     fun toggleAutoFocus() {
+        if (_ui.value.locked) return
         val c = _ui.value.controls
-        if (c.focusMode == ControlMode.AUTO) {
-            selectFocus()
+        val next = if (c.focusMode == ControlMode.MANUAL) {
+            c.copy(focusMode = ControlMode.AUTO)
         } else {
-            push(c.copy(focusMode = ControlMode.AUTO))
-            // back to full-frame continuous AF, not the last tapped box
-            controller.clearFocusRegion()
-            _ui.value = _ui.value.copy(focusPoint = null)
+            c.copy(afSingle = !c.afSingle)
         }
+        push(next)
+        // back to a full-frame start, not the last tapped box
+        controller.clearFocusRegion()
+        _ui.value = _ui.value.copy(
+            focusPoint = null,
+            notice = if (next.afSingle) {
+                "AF-S — focuses only on half-press or tap, then holds"
+            } else {
+                "AF-C — focuses continuously"
+            },
+        )
     }
 
     fun toggleAutoWb() {
@@ -609,6 +679,47 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     fun toggleHistogram() = push(
         _ui.value.controls.let { it.copy(histogramEnabled = !it.histogramEnabled) },
     )
+
+    /** RES: steps through the camera's photo sizes, largest first. */
+    fun cyclePhotoSize() {
+        val ui = _ui.value
+        if (ui.locked || ui.busy) return
+        val caps = ui.caps ?: return
+        val sizes = caps.photoSizes
+        val current = caps.photoSize(ui.controls.photoSizeKey)
+        val next = sizes[(sizes.indexOf(current) + 1) % sizes.size]
+        push(ui.controls.copy(photoSizeKey = next.key))
+        _ui.value = _ui.value.copy(
+            notice = buildString {
+                append("${next.label} — ${next.size.width}x${next.size.height}")
+            },
+        )
+    }
+
+    /** HDR: Ultra HDR JPEG built from RAW ↔ plain SDR JPEG. */
+    fun toggleHdr() {
+        val ui = _ui.value
+        if (ui.locked || ui.busy) return
+        val caps = ui.caps ?: return
+        if (!caps.supportsRaw || ui.plan?.raw == false) {
+            _ui.value = ui.copy(notice = "Ultra HDR is made from RAW, and camera ${caps.cameraId} gives none")
+            return
+        }
+        val next = !ui.controls.hdr
+        push(ui.controls.copy(hdr = next))
+        _ui.value = _ui.value.copy(
+            notice = if (next) {
+                "Ultra HDR — gain map from RAW for HDR screens"
+            } else {
+                "SDR — plain JPEG"
+            },
+        )
+    }
+
+    private fun rebuildSession() {
+        _ui.value = _ui.value.copy(ready = false)
+        previewSurface?.let { restartSession(it) }
+    }
 
     fun toggleFastViewfinder() {
         val caps = _ui.value.caps ?: return
@@ -752,6 +863,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     // camera body does: half-press focuses and holds, full press shoots.
     // ------------------------------------------------------------------
 
+    private var lastAfState: Int? = null
     private var halfPressed = false
 
     /** Focusing that the half-press started; a full press waits for it. */
@@ -772,7 +884,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         if (ui.locked || !ui.ready) return
         if (ui.controls.focusMode != ControlMode.AUTO || caps.maxAfRegions <= 0) return
 
-        halfPressMadeRegion = !controller.hasFocusRegion()
+        halfPressMadeRegion = !controller.hasTappedRegion()
         Log.i(TAG, "shutter key: half-press, AF on ${if (halfPressMadeRegion) "centre" else "tapped point"}")
         val (x, y) = if (halfPressMadeRegion) 0.5f to 0.5f else lastTapPoint ?: (0.5f to 0.5f)
         _ui.value = ui.copy(focusPoint = FocusPoint(x, y, android.os.SystemClock.uptimeMillis()))
@@ -800,6 +912,8 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         // before focus has landed, and that shot is still waiting on it.
         halfPressJob = null
         if (!halfPressMadeRegion) return // a tapped subject stays chosen
+        // AF-S holds the focus it found until the next half-press or tap.
+        if (_ui.value.controls.afSingle) return
         halfPressMadeRegion = false
         // Back to continuous AF — but not in the middle of a shot, where
         // restarting the preview would race the still request.
@@ -842,12 +956,20 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
         viewModelScope.launch {
             val orientation = Camera2Controller.jpegOrientation(caps, deviceOrientation)
-            val wantRaw = _ui.value.controls.rawEnabled
-            val shot = controller.captureStill(orientation, wantRaw)
+            val wantDng = _ui.value.controls.rawEnabled
+            // Ultra HDR is built from the RAW frame, so it rides along even
+            // when only a JPEG is being saved.
+            val wantHdr = _ui.value.controls.hdr && _ui.value.plan?.raw == true
+            val shot = controller.captureStill(
+                orientation,
+                wantRaw = wantDng || wantHdr,
+                hdrBracketStops = if (wantHdr) HDR_BRACKET_STOPS else 0,
+            )
 
             if (shot.error != null) {
                 Log.e(TAG, "capture error: ${shot.error}")
                 shot.rawImage?.close()
+                shot.darkRaw?.close()
                 _ui.value = _ui.value.copy(busy = false, notice = shot.error)
                 // A request the HAL never answered can leave the pipeline
                 // stalled with a frozen viewfinder; reopening is the only
@@ -867,8 +989,21 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 var jpegSize = 0L
                 var dngSize = 0L
                 var dngUri: android.net.Uri? = null
+                var hdrStops: Double? = null
 
-                shot.jpegBytes?.let { bytes ->
+                val jpegOut = shot.jpegBytes?.let { sdr ->
+                    val raw = shot.rawImage
+                    if (wantHdr && raw != null && shot.result != null) {
+                        UltraHdr.encode(
+                            sdr, raw, shot.result, controller.cameraCharacteristics(), orientation,
+                            shot.darkRaw, shot.darkResult,
+                        )?.let { hdrStops = it.maxBoostStops; it.jpeg } ?: sdr
+                    } else {
+                        sdr
+                    }
+                }
+
+                jpegOut?.let { bytes ->
                     val (u, s) = mediaWriter.writeJpeg(
                         bytes, shot.result, caps.focalLengthMm, caps.aperture, location, base,
                     )
@@ -876,7 +1011,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 }
 
                 val raw = shot.rawImage
-                if (raw != null && shot.result != null) {
+                if (wantDng && raw != null && shot.result != null) {
                     try {
                         val (u, s) = mediaWriter.writeDng(
                             raw,
@@ -893,17 +1028,27 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     raw?.close()
                 }
+                shot.darkRaw?.close()
 
                 buildString {
                     append(base)
-                    if (jpegUri != null) append("  JPG ${jpegSize / 1024}KB")
+                    if (jpegUri != null) {
+                        append(if (hdrStops != null) "  UHDR" else "  JPG")
+                        append(" ${jpegSize / 1024}KB")
+                        hdrStops?.let { append(" +%.1fEV".format(java.util.Locale.ROOT, it)) }
+                        if (wantHdr && hdrStops == null) append(" (no HDR highlights)")
+                    }
                     if (dngUri != null) append("  DNG ${dngSize / 1024 / 1024}MB")
                     append("  ${shot.wallClockMs}ms")
                 }
             }
 
             Log.i(TAG, "saved: $summary")
-            _ui.value = _ui.value.copy(busy = false, lastSaved = summary)
+            _ui.value = _ui.value.copy(
+                busy = false,
+                lastSaved = summary,
+                savedSeq = _ui.value.savedSeq + 1,
+            )
         }
     }
 

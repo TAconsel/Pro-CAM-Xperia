@@ -15,6 +15,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -52,6 +53,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.procam.camera.ControlMode
 import com.procam.camera.FlashMode
 import com.procam.camera.IsoScale
+import com.procam.camera.PhotoSize
 import com.procam.camera.ShutterScale
 import com.procam.camera.diopterToLabel
 import com.procam.camera.formatEv
@@ -119,6 +121,17 @@ fun CameraScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // A click when a half-press or tap AF cycle locks, two ticks when it
+    // gives up — so focus can be confirmed without looking at the reticle.
+    val haptic = remember(context) { HapticEngine(context) }
+    LaunchedEffect(ui.focusFeedbackSeq) {
+        if (ui.focusFeedbackSeq == 0) return@LaunchedEffect
+        if (ui.focusFeedbackOk) haptic.focusLocked() else haptic.focusFailed()
+    }
+    LaunchedEffect(ui.savedSeq) {
+        if (ui.savedSeq != 0) haptic.saved()
+    }
+
     val levelSensor = remember { LevelSensor(context) }
     val level by levelSensor.state.collectAsState()
     levelSensor.displayRotation = surfaceRotation
@@ -158,103 +171,114 @@ fun CameraScreen(
                     (b + ui.previewRotationOffset + 360) % 360
                 }
 
-                Box(
-                    Modifier
-                        .fillMaxHeight()
-                        .aspectRatio(4f / 3f)
-                        .background(Color.Black)
-                        .pointerInput(caps, previewRotation) {
-                            detectTapGestures { pos ->
-                                val c = caps ?: return@detectTapGestures
-                                vm.tapToFocus(
-                                    nx = (pos.x / size.width).coerceIn(0f, 1f),
-                                    ny = (pos.y / size.height).coerceIn(0f, 1f),
-                                    previewRotation = previewRotation,
-                                    mirrored = !c.facingBack,
+                // The bars sit above and below the image instead of over it,
+                // so the image is sized to the height between them.
+                BoxWithConstraints(Modifier.fillMaxHeight()) {
+                    val previewHeight = maxHeight - TOP_STRIP_HEIGHT - BOTTOM_STRIP_HEIGHT
+                    val previewWidth = previewHeight * (4f / 3f)
+                    Column(Modifier.fillMaxHeight().width(previewWidth)) {
+                        PreviewTopStrip(vm, Modifier.height(TOP_STRIP_HEIGHT))
+                        Box(
+                            Modifier
+                                .width(previewWidth)
+                                .height(previewHeight)
+                                .background(Color.Black)
+                                .pointerInput(caps, previewRotation) {
+                                    detectTapGestures { pos ->
+                                        val c = caps ?: return@detectTapGestures
+                                        vm.tapToFocus(
+                                            nx = (pos.x / size.width).coerceIn(0f, 1f),
+                                            ny = (pos.y / size.height).coerceIn(0f, 1f),
+                                            previewRotation = previewRotation,
+                                            mirrored = !c.facingBack,
+                                        )
+                                    }
+                                },
+                        ) {
+                            if (caps != null) {
+                                val rotation = previewRotation
+                                LaunchedEffect(displayDegrees, caps.sensorOrientation, rotation) {
+                                    android.util.Log.i(
+                                        "ProCam.Rot",
+                                        "displayDegrees=$displayDegrees sensorOrientation=" +
+                                            "${caps.sensorOrientation} facingBack=${caps.facingBack} " +
+                                            "offset=${ui.previewRotationOffset} " +
+                                            "final=$rotation buffer=${caps.previewSize}",
+                                    )
+                                }
+                                AndroidView(
+                                    modifier = Modifier.fillMaxSize(),
+                                    factory = { ctx ->
+                                        CameraGLSurfaceView(ctx).apply {
+                                            init(caps.previewSize) { st -> vm.onSurfaceTextureReady(st) }
+                                            glView = this
+                                        }
+                                    },
+                                    update = { v ->
+                                        v.previewRenderer.bufferSize = caps.previewSize
+                                        v.previewRenderer.overlay = overlay
+                                        v.previewRenderer.rotationDegrees = rotation
+                                        v.previewRenderer.mirror = !caps.facingBack
+                                    },
+                                    // Leaving this view behind without releasing the
+                                    // SurfaceTexture keeps a camera-facing buffer queue
+                                    // alive across a trip to the diagnostics screen.
+                                    onRelease = { v ->
+                                        if (glView === v) glView = null
+                                        runCatching { v.previewRenderer.releaseSurfaceTexture() }
+                                    },
                                 )
                             }
-                        },
-                ) {
-                    if (caps != null) {
-                        val rotation = previewRotation
-                        LaunchedEffect(displayDegrees, caps.sensorOrientation, rotation) {
-                            android.util.Log.i(
-                                "ProCam.Rot",
-                                "displayDegrees=$displayDegrees sensorOrientation=" +
-                                    "${caps.sensorOrientation} facingBack=${caps.facingBack} " +
-                                    "offset=${ui.previewRotationOffset} " +
-                                    "final=$rotation buffer=${caps.previewSize}",
-                            )
-                        }
-                        AndroidView(
-                            modifier = Modifier.fillMaxSize(),
-                            factory = { ctx ->
-                                CameraGLSurfaceView(ctx).apply {
-                                    init(caps.previewSize) { st -> vm.onSurfaceTextureReady(st) }
-                                    glView = this
+
+                            caps?.photoSize(ui.controls.photoSizeKey)?.size?.let {
+                                CropGuide(it.width.toFloat() / it.height)
+                            }
+
+                            if (ui.controls.gridEnabled) GridOverlay()
+
+                            if (ui.controls.levelEnabled && level.available) {
+                                LevelOverlay(
+                                    rollDeg = level.rollDeg,
+                                    pitchDeg = level.pitchDeg,
+                                    isLevel = level.isLevel,
+                                )
+                            }
+
+                            ui.focusPoint?.let { fp ->
+                                FocusReticle(fp.x, fp.y, ui.afState)
+                                LaunchedEffect(fp.stamp) {
+                                    kotlinx.coroutines.delay(2200)
+                                    vm.clearFocusPoint()
                                 }
-                            },
-                            update = { v ->
-                                v.previewRenderer.bufferSize = caps.previewSize
-                                v.previewRenderer.overlay = overlay
-                                v.previewRenderer.rotationDegrees = rotation
-                                v.previewRenderer.mirror = !caps.facingBack
-                            },
-                            // Leaving this view behind without releasing the
-                            // SurfaceTexture keeps a camera-facing buffer queue
-                            // alive across a trip to the diagnostics screen.
-                            onRelease = { v ->
-                                if (glView === v) glView = null
-                                runCatching { v.previewRenderer.releaseSurfaceTexture() }
-                            },
-                        )
-                    }
+                            }
 
-                    if (ui.controls.gridEnabled) GridOverlay()
+                            if (ui.controls.histogramEnabled && ui.plan?.hasHistogram == true) {
+                                HistogramView(
+                                    data = hist,
+                                    showRgb = ui.showRgbHistogram,
+                                    modifier = Modifier
+                                        .align(Alignment.BottomEnd)
+                                        .padding(end = 8.dp, bottom = 8.dp)
+                                        .width(150.dp)
+                                        .height(64.dp)
+                                        .clickable { vm.toggleRgbHistogram() },
+                                )
+                            }
 
-                    if (ui.controls.levelEnabled && level.available) {
-                        LevelOverlay(
-                            rollDeg = level.rollDeg,
-                            pitchDeg = level.pitchDeg,
-                            isLevel = level.isLevel,
-                        )
-                    }
-
-                    ui.focusPoint?.let { fp ->
-                        FocusReticle(fp.x, fp.y, ui.afState)
-                        LaunchedEffect(fp.stamp) {
-                            kotlinx.coroutines.delay(2200)
-                            vm.clearFocusPoint()
+                            if (ui.previewSimulated) {
+                                Text2(
+                                    "PREVIEW SIMULATED · ${formatShutter(ui.controls.exposureTimeNs)} ON CAPTURE",
+                                    ProTheme.Accent,
+                                    10.sp,
+                                    Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(top = 8.dp, end = 8.dp)
+                                        .background(Color(0xAA000000))
+                                        .padding(horizontal = 6.dp, vertical = 3.dp),
+                                )
+                            }
                         }
-                    }
-
-                    PreviewTopStrip(vm, Modifier.align(Alignment.TopStart))
-                    PreviewBottomStrip(vm, level.rollDeg, Modifier.align(Alignment.BottomStart))
-
-                    if (ui.controls.histogramEnabled && ui.plan?.hasHistogram == true) {
-                        HistogramView(
-                            data = hist,
-                            showRgb = ui.showRgbHistogram,
-                            modifier = Modifier
-                                .align(Alignment.BottomEnd)
-                                .padding(end = 10.dp, bottom = 34.dp)
-                                .width(150.dp)
-                                .height(64.dp)
-                                .clickable { vm.toggleRgbHistogram() },
-                        )
-                    }
-
-                    if (ui.previewSimulated) {
-                        Text2(
-                            "PREVIEW SIMULATED · ${formatShutter(ui.controls.exposureTimeNs)} ON CAPTURE",
-                            ProTheme.Accent,
-                            10.sp,
-                            Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(top = 26.dp, end = 8.dp)
-                                .background(Color(0xAA000000))
-                                .padding(horizontal = 6.dp, vertical = 3.dp),
-                        )
+                        PreviewBottomStrip(vm, level.rollDeg, Modifier.height(BOTTOM_STRIP_HEIGHT))
                     }
                 }
 
@@ -263,6 +287,9 @@ fun CameraScreen(
         }
     }
 }
+
+private val TOP_STRIP_HEIGHT = 22.dp
+private val BOTTOM_STRIP_HEIGHT = 34.dp
 
 @Composable
 private fun rememberSurfaceRotation(
@@ -348,16 +375,15 @@ private fun LeftRail(
 private fun PreviewTopStrip(vm: CameraViewModel, modifier: Modifier) {
     val ui by vm.ui.collectAsState()
     val caps = ui.caps ?: return
-    val raw = if (ui.controls.rawEnabled && caps.supportsRaw) "RAW+JPEG" else "JPEG"
-    val mp = caps.jpegSize?.let {
-        "%.1fMP".format(it.width.toLong() * it.height / 1_000_000.0)
-    } ?: "-"
+    val photo = caps.photoSize(ui.controls.photoSizeKey)
+    val jpeg = if (ui.controls.hdr && ui.plan?.raw == true) "UHDR" else "JPEG"
+    val raw = if (ui.controls.rawEnabled && ui.plan?.raw == true) "RAW+$jpeg" else jpeg
+    val mp = "%.1fMP".format(photo.size.width.toLong() * photo.size.height / 1_000_000.0)
 
     Row(
         modifier
             .fillMaxWidth()
-            .background(Color(0x66000000))
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .padding(horizontal = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -366,7 +392,12 @@ private fun PreviewTopStrip(vm: CameraViewModel, modifier: Modifier) {
         Text2(mp, ProTheme.TextPrimary, 10.sp)
         Text2(raw, if (raw.startsWith("RAW")) ProTheme.Accent else ProTheme.TextPrimary, 10.sp)
         Spacer(Modifier.weight(1f))
-        ui.plan?.let { Text2(it.label, ProTheme.TextDim, 9.sp) }
+        val saved = ui.lastSaved
+        if (saved != null) {
+            Text2(saved, ProTheme.Ok, 9.sp)
+        } else {
+            ui.plan?.let { Text2(it.label, ProTheme.TextDim, 9.sp) }
+        }
     }
 }
 
@@ -378,45 +409,35 @@ private fun PreviewBottomStrip(vm: CameraViewModel, rollDeg: Float, modifier: Mo
     val iso = ui.liveIso?.toString() ?: "--"
     val f = ui.liveAperture ?: caps?.aperture ?: 0f
     val ev = formatEv(ui.controls.evSteps, caps?.evStep ?: 1.0)
-    val focus = if (ui.controls.focusMode == ControlMode.MANUAL) {
-        "MF ${diopterToLabel(ui.controls.focusDiopter)}"
-    } else {
-        "AF-C"
+    val focus = when {
+        ui.controls.focusMode == ControlMode.MANUAL -> "MF ${diopterToLabel(ui.controls.focusDiopter)}"
+        ui.controls.afSingle -> "AF-S"
+        else -> "AF-C"
     }
 
-    Column(modifier.fillMaxWidth()) {
-        ui.lastSaved?.let {
+    Row(
+        modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text2(ui.mode.name, ProTheme.Accent, ProTheme.ReadoutSize, weight = FontWeight.Bold)
+        Text2(shutter, ProTheme.TextPrimary, ProTheme.ReadoutSize, weight = FontWeight.Medium)
+        Text2("f/${"%.2f".format(f)}", ProTheme.TextPrimary, ProTheme.ReadoutSize)
+        Text2(ev, ProTheme.TextPrimary, ProTheme.ReadoutSize)
+        Text2("ISO $iso", ProTheme.TextPrimary, ProTheme.ReadoutSize)
+        Text2(focus, ProTheme.TextSecondary, ProTheme.ReadoutSize)
+        Spacer(Modifier.weight(1f))
+        // The shutter is the hardware key now, so this is the only sign a
+        // shot is still being taken and written.
+        if (ui.busy) Text2("SAVING…", ProTheme.Accent, ProTheme.ReadoutSize, weight = FontWeight.Bold)
+        if (ui.controls.levelEnabled) {
             Text2(
-                it,
-                ProTheme.Ok,
-                9.sp,
-                Modifier
-                    .background(Color(0xAA000000))
-                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                "%+.1f°".format(rollDeg),
+                if (kotlin.math.abs(rollDeg) <= 1f) ProTheme.Ok else ProTheme.TextSecondary,
+                ProTheme.ReadoutSize,
             )
-        }
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .background(Color(0x88000000))
-                .padding(horizontal = 8.dp, vertical = 5.dp),
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text2(ui.mode.name, ProTheme.Accent, ProTheme.ReadoutSize, weight = FontWeight.Bold)
-            Text2(shutter, ProTheme.TextPrimary, ProTheme.ReadoutSize, weight = FontWeight.Medium)
-            Text2("f/${"%.2f".format(f)}", ProTheme.TextPrimary, ProTheme.ReadoutSize)
-            Text2(ev, ProTheme.TextPrimary, ProTheme.ReadoutSize)
-            Text2("ISO $iso", ProTheme.TextPrimary, ProTheme.ReadoutSize)
-            Text2(focus, ProTheme.TextSecondary, ProTheme.ReadoutSize)
-            if (ui.controls.levelEnabled) {
-                Spacer(Modifier.weight(1f))
-                Text2(
-                    "%+.1f°".format(rollDeg),
-                    if (kotlin.math.abs(rollDeg) <= 1f) ProTheme.Ok else ProTheme.TextSecondary,
-                    ProTheme.ReadoutSize,
-                )
-            }
         }
     }
 }
@@ -562,7 +583,11 @@ private fun ControlDeck(
         // ---- AF-ON / AWB ---------------------------------------------------
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ActionButton(
-                "AF-ON",
+                when {
+                    c.focusMode == ControlMode.MANUAL -> "AF"
+                    c.afSingle -> "AF-S"
+                    else -> "AF-C"
+                },
                 active = c.focusMode == ControlMode.AUTO,
                 enabled = on && (caps?.supportsManualFocus ?: false),
                 modifier = Modifier.weight(1f),
@@ -606,7 +631,11 @@ private fun ControlDeck(
             ) { vm.selectTint() }
             DeckButton(
                 "FOCUS",
-                if (c.focusMode == ControlMode.AUTO) "AF-C" else diopterToLabel(c.focusDiopter),
+                when {
+                    c.focusMode == ControlMode.MANUAL -> diopterToLabel(c.focusDiopter)
+                    c.afSingle -> "AF-S"
+                    else -> "AF-C"
+                },
                 selected = ui.scrubTarget == ScrubTarget.FOCUS,
                 enabled = on && (caps?.supportsManualFocus ?: false),
                 modifier = cell,
@@ -678,8 +707,21 @@ private fun ControlDeck(
                 enabled = on && caps?.fastPreviewFps != null,
                 modifier = cell,
             ) { vm.toggleFastViewfinder() }
-            Spacer(cell)
-            Spacer(cell)
+            val photo = caps?.photoSize(c.photoSizeKey)
+            DeckButton(
+                "RES", photo?.label ?: "-",
+                selected = photo != null && photo.key != PhotoSize.DEFAULT_KEY,
+                enabled = on && (caps?.photoSizes?.size ?: 0) > 1,
+                modifier = cell,
+            ) { vm.cyclePhotoSize() }
+            // Lit only when the shot really will be Ultra HDR: it needs RAW.
+            val hdrOn = c.hdr && ui.plan?.raw != false
+            DeckButton(
+                "HDR", if (hdrOn) "UHDR" else "SDR",
+                selected = hdrOn,
+                enabled = on && (caps?.supportsRaw ?: false),
+                modifier = cell,
+            ) { vm.toggleHdr() }
         }
 
         ui.notice?.let {
@@ -696,7 +738,8 @@ private fun ControlDeck(
 
         Spacer(Modifier.weight(1f))
 
-        // ---- lock + shutter -------------------------------------------------
+        // ---- lock -------------------------------------------------------------
+        // No on-screen shutter: pictures are taken with the hardware key.
         Row(
             Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -718,12 +761,6 @@ private fun ControlDeck(
                 Text2("Lock", if (ui.locked) ProTheme.Accent else ProTheme.TextSecondary, 10.sp)
             }
 
-            ShutterButton(
-                busy = ui.busy,
-                enabled = ui.ready,
-                rawArmed = c.rawEnabled && (caps?.supportsRaw ?: false),
-                onClick = { vm.capture() },
-            )
         }
     }
 }

@@ -485,6 +485,37 @@ fun GridOverlay(modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * Darkens what a non-4:3 photo size will crop off the 4:3 preview, with a
+ * thin frame on the edge that stays. [aspect] is width / height of the photo.
+ */
+@Composable
+fun CropGuide(aspect: Float, modifier: Modifier = Modifier) {
+    Canvas(modifier.fillMaxSize()) {
+        val previewAspect = size.width / size.height
+        if (kotlin.math.abs(aspect - previewAspect) < 0.01f) return@Canvas
+        val shade = Color(0x99000000)
+        val edge = Color(0x80FFFFFF)
+        if (aspect > previewAspect) {
+            // wider: bands top and bottom
+            val h = size.width / aspect
+            val band = (size.height - h) / 2f
+            drawRect(shade, Offset.Zero, androidx.compose.ui.geometry.Size(size.width, band))
+            drawRect(shade, Offset(0f, size.height - band), androidx.compose.ui.geometry.Size(size.width, band))
+            drawLine(edge, Offset(0f, band), Offset(size.width, band), strokeWidth = 1f)
+            drawLine(edge, Offset(0f, size.height - band), Offset(size.width, size.height - band), strokeWidth = 1f)
+        } else {
+            // narrower: bands left and right
+            val w = size.height * aspect
+            val band = (size.width - w) / 2f
+            drawRect(shade, Offset.Zero, androidx.compose.ui.geometry.Size(band, size.height))
+            drawRect(shade, Offset(size.width - band, 0f), androidx.compose.ui.geometry.Size(band, size.height))
+            drawLine(edge, Offset(band, 0f), Offset(band, size.height), strokeWidth = 1f)
+            drawLine(edge, Offset(size.width - band, 0f), Offset(size.width - band, size.height), strokeWidth = 1f)
+        }
+    }
+}
+
 /** P / S / M / MR selector on the left edge. */
 @Composable
 fun ModeDial(
@@ -587,98 +618,3 @@ fun LevelOverlay(
     }
 }
 
-/**
- * Shutter release, styled after a DSLR release button: a machined outer ring,
- * a raised inner disc that depresses on touch, and an amber sweep while the
- * sensor is actually integrating — which matters here, because a 32 s exposure
- * needs to visibly still be running.
- */
-@Composable
-fun ShutterButton(
-    busy: Boolean,
-    enabled: Boolean,
-    rawArmed: Boolean,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit,
-) {
-    val interaction = remember { MutableInteractionSource() }
-    val pressed by interaction.collectIsPressedAsState()
-    val discScale by animateFloatAsState(
-        targetValue = if (pressed) 0.86f else 1f,
-        animationSpec = tween(90),
-        label = "shutterPress",
-    )
-    val sweep by rememberInfiniteTransition(label = "shutterBusy")
-        .animateFloat(
-            initialValue = 0f,
-            targetValue = 360f,
-            animationSpec = infiniteRepeatable(tween(1100, easing = LinearEasing)),
-            label = "shutterSweep",
-        )
-
-    Box(
-        modifier
-            .size(74.dp)
-            .clickable(
-                interactionSource = interaction,
-                indication = null,
-                enabled = enabled && !busy,
-                onClick = onClick,
-            ),
-        contentAlignment = Alignment.Center,
-    ) {
-        Canvas(Modifier.fillMaxSize()) {
-            val r = size.minDimension / 2f
-            val ringStroke = r * 0.075f
-            val ringR = r - ringStroke / 2f
-
-            // Outer bezel. It goes amber as a whole when a DNG is armed — a
-            // partial arc there read as a rendering glitch rather than a state.
-            drawCircle(
-                color = when {
-                    !enabled -> Color(0xFF2A2A2A)
-                    rawArmed -> ProTheme.Accent
-                    else -> Color(0xFF6A6A6A)
-                },
-                radius = ringR,
-                style = Stroke(width = ringStroke),
-            )
-
-            // busy sweep rides just inside the bezel
-            if (busy) {
-                val inset = ringStroke * 2.2f
-                drawArc(
-                    color = ProTheme.Accent,
-                    startAngle = sweep,
-                    sweepAngle = 100f,
-                    useCenter = false,
-                    topLeft = Offset(inset, inset),
-                    size = androidx.compose.ui.geometry.Size(
-                        size.width - inset * 2, size.height - inset * 2,
-                    ),
-                    style = Stroke(width = ringStroke * 1.3f, cap = StrokeCap.Round),
-                )
-            }
-
-            // inner release disc
-            val discR = r * 0.68f * discScale
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = when {
-                        !enabled -> listOf(Color(0xFF3A3A3A), Color(0xFF262626))
-                        busy -> listOf(Color(0xFFFFD79A), ProTheme.Accent)
-                        else -> listOf(Color(0xFFFFFFFF), Color(0xFFC8C8C8))
-                    },
-                    center = Offset(size.width * 0.40f, size.height * 0.36f),
-                    radius = discR * 1.7f,
-                ),
-                radius = discR,
-            )
-            drawCircle(
-                color = Color(0x26000000),
-                radius = discR,
-                style = Stroke(width = 1.2f),
-            )
-        }
-    }
-}

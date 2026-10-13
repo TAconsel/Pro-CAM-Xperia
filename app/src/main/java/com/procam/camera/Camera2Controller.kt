@@ -42,6 +42,10 @@ import kotlin.coroutines.resume
 
 private const val TAG = "ProCam.Controller"
 
+private const val TAG_MAIN = "main"
+private const val TAG_DARK = "dark"
+
+
 /**
  * Which output streams a session actually got. The device decides — LEVEL_3
  * only guarantees PRIV(preview) + PRIV(VGA) + JPEG(max) + RAW(max), and a YUV
@@ -53,6 +57,8 @@ data class StreamPlan(
     val yuvSize: Size?,
     val jpeg: Boolean,
     val raw: Boolean,
+    /** The JPEG size, from the RES choice. */
+    val photo: PhotoSize,
 ) {
     val hasHistogram get() = yuvSize != null
 }
@@ -64,6 +70,9 @@ data class ShotResult(
     val requestedExposureNs: Long,
     val wallClockMs: Long,
     val error: String? = null,
+    /** The underexposed RAW of an HDR bracket, and its metadata. */
+    val darkRaw: Image? = null,
+    val darkResult: TotalCaptureResult? = null,
 ) {
     override fun equals(other: Any?) = this === other
     override fun hashCode() = System.identityHashCode(this)
@@ -232,7 +241,11 @@ class Camera2Controller(context: Context) {
     }
 
     private fun closeReaders() {
-        runCatching { yuvReader?.close() }
+        // The analysis reader is closed on its own thread: closing it from
+        // here while the histogram is still reading a frame invalidates that
+        // frame's buffer under it ("buffer is inaccessible"), which a session
+        // rebuild for RES or HDR makes easy to hit.
+        yuvReader?.let { r -> analysisHandler.post { runCatching { r.close() } } }
         runCatching { jpegReader?.close() }
         runCatching { rawReader?.close() }
         yuvReader = null
@@ -247,14 +260,16 @@ class Camera2Controller(context: Context) {
     private fun candidatePlans(caps: CameraCapabilities): List<StreamPlan> {
         val small = caps.availableAnalysisSizes.firstOrNull { it.width == 320 }
             ?: Size(320, 240)
+        val photo = caps.photoSize(controls.photoSizeKey)
+
         return buildList {
             if (caps.supportsRaw) {
-                add(StreamPlan("preview+YUV${caps.analysisSize.width}+JPEG+RAW", caps.analysisSize, true, true))
-                add(StreamPlan("preview+YUV${small.width}+JPEG+RAW", small, true, true))
-                add(StreamPlan("preview+JPEG+RAW", null, true, true))
+                add(StreamPlan("preview+YUV${caps.analysisSize.width}+JPEG+RAW", caps.analysisSize, true, true, photo))
+                add(StreamPlan("preview+YUV${small.width}+JPEG+RAW", small, true, true, photo))
+                add(StreamPlan("preview+JPEG+RAW", null, true, true, photo))
             }
-            add(StreamPlan("preview+YUV${caps.analysisSize.width}+JPEG", caps.analysisSize, true, false))
-            add(StreamPlan("preview+JPEG", null, true, false))
+            add(StreamPlan("preview+YUV${caps.analysisSize.width}+JPEG", caps.analysisSize, true, false, photo))
+            add(StreamPlan("preview+JPEG", null, true, false, photo))
         }
     }
 
@@ -284,7 +299,10 @@ class Camera2Controller(context: Context) {
                 yuvReader = ImageReader.newInstance(sz.width, sz.height, ImageFormat.YUV_420_888, 3)
                     .also { r ->
                         r.setOnImageAvailableListener({ reader ->
-                            val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                            // A frame can still be queued for a reader that has
+                            // just been closed by a session rebuild.
+                            val img = runCatching { reader.acquireLatestImage() }.getOrNull()
+                                ?: return@setOnImageAvailableListener
                             try {
                                 onAnalysisFrame?.invoke(img)
                             } finally {
@@ -296,7 +314,7 @@ class Camera2Controller(context: Context) {
             }
 
             if (plan.jpeg) {
-                val sz = capabilities.jpegSize ?: DeviceProfile.JPEG_SIZE
+                val sz = plan.photo.size
                 jpegReader = ImageReader.newInstance(sz.width, sz.height, ImageFormat.JPEG, 2)
                     .also { r ->
                         r.setOnImageAvailableListener({ reader ->
@@ -422,7 +440,7 @@ class Camera2Controller(context: Context) {
     }
 
     /** @param sensorX/@param sensorY normalised point in the sensor's own frame. */
-    fun focusAt(sensorX: Float, sensorY: Float) {
+    fun focusAt(sensorX: Float, sensorY: Float, fromTap: Boolean = true) {
         if (device == null || session == null) return
         if (capabilities.maxAfRegions <= 0) return
 
@@ -442,14 +460,17 @@ class Camera2Controller(context: Context) {
         val region = arrayOf(MeteringRectangle(rect, MeteringRectangle.METERING_WEIGHT_MAX))
         afRegions = region
         aeRegions = region
+        regionFromTap = fromTap
 
         // repeating request first, so the new region is what the trigger acts on
         startPreview()
         triggerAfCycle()
     }
 
-    /** True while an AF region is set, from a tap or a half-press. */
-    fun hasFocusRegion(): Boolean = afRegions != null
+    /** True while the AF region is one the user tapped. */
+    fun hasTappedRegion(): Boolean = afRegions != null && regionFromTap
+
+    private var regionFromTap = false
 
     /**
      * Half-press of a two-stage shutter key: one AF cycle that then holds,
@@ -465,7 +486,7 @@ class Camera2Controller(context: Context) {
      * trigger-locked never returns a result and stalls the preview for good.
      */
     fun halfPressFocus() {
-        if (afRegions == null) focusAt(0.5f, 0.5f) else triggerAfCycle()
+        if (hasTappedRegion()) triggerAfCycle() else focusAt(0.5f, 0.5f, fromTap = false)
     }
 
     private fun triggerAfCycle() {
@@ -499,7 +520,7 @@ class Camera2Controller(context: Context) {
             val builder = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             previewSurface?.let { builder.addTarget(it) }
             builder.applyControls(controls, capabilities, DeviceProfile.PREVIEW_EXPOSURE_CAP_NS)
-            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
             runCatching { s.capture(builder.build(), null, cameraHandler) }
         }
         startPreview()
@@ -529,8 +550,9 @@ class Camera2Controller(context: Context) {
         // that means leaking a buffer the ImageReader can never hand out again,
         // and with maxImages=2 two leaks stall the camera — so anything dropped
         // or left over gets closed explicitly.
-        val raw = Channel<Image>(Channel.CONFLATED, onUndeliveredElement = { it.close() })
+        val raw = Channel<Image>(Channel.UNLIMITED, onUndeliveredElement = { it.close() })
         val result = CompletableDeferred<TotalCaptureResult?>()
+        val darkResult = CompletableDeferred<TotalCaptureResult?>()
 
         fun dispose() {
             jpeg.cancel()
@@ -547,7 +569,13 @@ class Camera2Controller(context: Context) {
      * multi-second capture with a preview stream makes the HAL's job ambiguous
      * and on some devices silently shortens the exposure.
      */
-    suspend fun captureStill(jpegOrientation: Int, wantRaw: Boolean): ShotResult =
+    /**
+     * @param hdrBracketStops when above zero, a second RAW-only frame this
+     *   many stops darker follows the shot in the same burst. Where the normal
+     *   RAW clipped it still holds the highlights, which is what gives an
+     *   Ultra HDR gain map real range rather than a guess.
+     */
+    suspend fun captureStill(jpegOrientation: Int, wantRaw: Boolean, hdrBracketStops: Int = 0): ShotResult =
         captureMutex.withLock {
             val dev = device ?: return ShotResult(null, null, null, 0, 0, "camera not open")
             val s = session ?: return ShotResult(null, null, null, 0, 0, "no session")
@@ -583,27 +611,70 @@ class Camera2Controller(context: Context) {
             builder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
             builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
 
+            builder.setTag(TAG_MAIN)
+
+            // The dark frame: same ISO and focus, a fraction of the exposure,
+            // RAW only. Taken from the preview's metering in the auto modes,
+            // which is what the shot itself is about to use.
+            val bracket = hdrBracketStops > 0 && useRaw
+            val dark = if (bracket) {
+                val iso = if (controls.exposureMode == ControlMode.MANUAL) {
+                    controls.iso
+                } else {
+                    liveResult.value?.get(android.hardware.camera2.CaptureResult.SENSOR_SENSITIVITY) ?: 400
+                }.coerceIn(capabilities.isoRange.lower, capabilities.isoRange.upper)
+                val darkNs = (exposureNs shr hdrBracketStops)
+                    .coerceIn(capabilities.exposureTimeRange.lower, capabilities.exposureTimeRange.upper)
+                // A preview-type request, not a still: on the Xperia 1 VII a
+                // still capture's RAW comes from the zero-shutter-lag buffer
+                // at the normal exposure, whatever the request asks for, while
+                // its metadata reports the dark settings. A preview request is
+                // a frame actually exposed with them.
+                dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                    rawReader?.surface?.let { addTarget(it) }
+                    applyControls(controls, capabilities, previewCap = null)
+                    applyRegions()
+                    set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                    set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, darkNs)
+                    set(CaptureRequest.SENSOR_FRAME_DURATION, darkNs)
+                    if (capabilities.hasFlash) set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+                    set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
+                    setTag(TAG_DARK)
+                }.build()
+            } else {
+                null
+            }
+
             val startedAt = System.currentTimeMillis()
 
-            runCatching {
-                s.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
-                    override fun onCaptureCompleted(
-                        cs: CameraCaptureSession,
-                        request: CaptureRequest,
-                        result: TotalCaptureResult,
-                    ) {
-                        shot.result.complete(result)
-                    }
+            val callback = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    cs: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: TotalCaptureResult,
+                ) {
+                    if (request.tag == TAG_DARK) shot.darkResult.complete(result)
+                    else shot.result.complete(result)
+                }
 
-                    override fun onCaptureFailed(
-                        cs: CameraCaptureSession,
-                        request: CaptureRequest,
-                        failure: CaptureFailure,
-                    ) {
-                        Log.e(TAG, "capture failed reason=${failure.reason}")
-                        shot.result.complete(null)
-                    }
-                }, cameraHandler)
+                override fun onCaptureFailed(
+                    cs: CameraCaptureSession,
+                    request: CaptureRequest,
+                    failure: CaptureFailure,
+                ) {
+                    Log.e(TAG, "capture failed reason=${failure.reason} tag=${request.tag}")
+                    if (request.tag == TAG_DARK) shot.darkResult.complete(null)
+                    else shot.result.complete(null)
+                }
+            }
+
+            runCatching {
+                if (dark != null) {
+                    s.captureBurst(listOf(builder.build(), dark), callback, cameraHandler)
+                } else {
+                    s.capture(builder.build(), callback, cameraHandler)
+                }
             }.onFailure {
                 pendingShot = null
                 shot.dispose()
@@ -617,7 +688,24 @@ class Camera2Controller(context: Context) {
 
             val result = withTimeoutOrNull(budgetMs) { shot.result.await() }
             val jpegBytes = withTimeoutOrNull(budgetMs) { shot.jpeg.receive() }
-            val rawImage = if (useRaw) withTimeoutOrNull(budgetMs) { shot.raw.receive() } else null
+            val darkResult = if (dark != null) withTimeoutOrNull(budgetMs) { shot.darkResult.await() } else null
+
+            // Each RAW buffer belongs to the request whose sensor timestamp it
+            // carries; the burst does not promise which arrives first.
+            var rawImage: Image? = null
+            var darkRaw: Image? = null
+            val expectRaws = if (!useRaw) 0 else if (dark != null) 2 else 1
+            repeat(expectRaws) {
+                val img = withTimeoutOrNull(budgetMs) { shot.raw.receive() } ?: return@repeat
+                val ts = img.timestamp
+                when {
+                    dark != null && darkResult?.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP) == ts &&
+                        darkRaw == null -> darkRaw = img
+                    rawImage == null -> rawImage = img
+                    darkRaw == null -> darkRaw = img
+                    else -> img.close()
+                }
+            }
 
             pendingShot = null
             shot.dispose() // closes any late or superseded RAW buffer
@@ -631,7 +719,12 @@ class Camera2Controller(context: Context) {
                 else -> null
             }
 
-            ShotResult(jpegBytes, rawImage, result, exposureNs, elapsed, error)
+            if (error != null) darkRaw?.close()
+            ShotResult(
+                jpegBytes, rawImage, result, exposureNs, elapsed, error,
+                darkRaw = if (error == null) darkRaw else null,
+                darkResult = darkResult,
+            )
         }
 
     internal fun cameraCharacteristics() =
