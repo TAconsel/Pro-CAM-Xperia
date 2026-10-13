@@ -103,13 +103,23 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     var deviceOrientation: Int = 0
 
     private val mrStore = MemoryRecallStore(app)
+    private val rotationStore = PreviewRotationStore(app)
     private var previewSurface: Surface? = null
     private var openJob: kotlinx.coroutines.Job? = null
     private var sessionJob: kotlinx.coroutines.Job? = null
     private var lastServoAt = 0L
 
     init {
-        _ui.value = _ui.value.copy(mrPresent = mrStore.hasSlot())
+        _ui.value = _ui.value.copy(
+            mrPresent = mrStore.hasSlot(),
+            previewRotationOffset = rotationStore.load(),
+        )
+
+        controller.onDeviceLost = { reason ->
+            // The framework handed our camera to someone else. Drop to a
+            // recoverable state rather than sitting on a dead handle.
+            _ui.value = _ui.value.copy(ready = false, notice = reason)
+        }
 
         controller.onAnalysisFrame = { image ->
             histogram.submit(image)
@@ -189,6 +199,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 )
             } catch (t: kotlinx.coroutines.CancellationException) {
                 throw t
+            } catch (t: com.procam.camera.Camera2Controller.CameraClosedException) {
+                // Backgrounded, or the camera was reclaimed, while we were
+                // configuring. Nothing is wrong and nothing to tell the user.
+                Log.i(TAG, "session setup abandoned: ${t.message}")
+                _ui.value = _ui.value.copy(ready = false)
             } catch (t: Throwable) {
                 Log.e(TAG, "startSession failed", t)
                 _ui.value = _ui.value.copy(ready = false, fatal = t.message ?: "session failed")
@@ -597,9 +612,48 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun cyclePreviewRotation() {
-        _ui.value = _ui.value.copy(
-            previewRotationOffset = (_ui.value.previewRotationOffset + 90) % 360,
-        )
+        val next = (_ui.value.previewRotationOffset + 90) % 360
+        rotationStore.save(next)
+        _ui.value = _ui.value.copy(previewRotationOffset = next)
+    }
+
+    // ------------------------------------------------------------------
+    // camera selection
+    // ------------------------------------------------------------------
+
+    /**
+     * Cycles through the cameras this app is actually allowed to open. On some
+     * devices that is every lens; on others the OEM reserves most of them and
+     * only one or two ever appear here.
+     */
+    fun switchCamera() {
+        if (_ui.value.locked || _ui.value.busy) return
+        val cams = _ui.value.cameras.ifEmpty { controller.availableCameras() }
+        if (cams.size < 2) {
+            _ui.value = _ui.value.copy(notice = "only one camera is available to apps here")
+            return
+        }
+        val currentId = _ui.value.caps?.cameraId
+        val idx = cams.indexOfFirst { it.cameraId == currentId }
+        val next = cams[(idx + 1).mod(cams.size)]
+
+        sessionJob?.cancel(); sessionJob = null
+        openJob?.cancel(); openJob = null
+        controller.close()
+        histogram.reset()
+        _ui.value = _ui.value.copy(ready = false, caps = null, plan = null, notice = null)
+
+        openJob = viewModelScope.launch {
+            try {
+                controller.open(next.cameraId)
+                _ui.value = _ui.value.copy(caps = controller.capabilities, cameras = cams)
+                applyDefaultsFor(controller.capabilities)
+                previewSurface?.let { restartSession(it) }
+            } catch (t: Throwable) {
+                Log.e(TAG, "switchCamera failed", t)
+                _ui.value = _ui.value.copy(fatal = t.message ?: "could not switch camera")
+            }
+        }
     }
 
     fun toggleLock() {

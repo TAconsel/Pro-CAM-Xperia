@@ -137,33 +137,75 @@ class Camera2Controller(context: Context) {
     @Volatile
     private var opened = CompletableDeferred<Boolean>()
 
+    /**
+     * Raised when the session could not be built because the camera went away
+     * underneath us — backgrounding, or the framework handing it to another
+     * app. Distinct from a genuine configuration failure so the UI can stay
+     * quiet instead of showing an error the user can do nothing about.
+     */
+    class CameraClosedException(message: String) : Exception(message)
+
+    /** Called when an already-open camera is taken away. */
+    var onDeviceLost: ((String) -> Unit)? = null
+
     @SuppressLint("MissingPermission")
     suspend fun open(cameraId: String) {
         check(device == null) { "camera already open" }
         if (opened.isCompleted) opened = CompletableDeferred()
-        capabilities = CameraCapabilities.from(cameraId, manager.getCameraCharacteristics(cameraId))
-        Log.i(TAG, "opening\n${capabilities.summary()}")
 
-        device = suspendCancellableCoroutine { cont ->
-            val settled = AtomicBoolean(false)
-            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-                override fun onOpened(camera: CameraDevice) {
-                    if (settled.compareAndSet(false, true)) cont.resume(camera)
-                    else camera.close()
-                }
+        var openedDevice: CameraDevice? = null
+        try {
+            capabilities =
+                CameraCapabilities.from(cameraId, manager.getCameraCharacteristics(cameraId))
+            Log.i(TAG, "opening " + capabilities.summary())
 
-                override fun onDisconnected(camera: CameraDevice) {
-                    camera.close()
-                    if (settled.compareAndSet(false, true)) cont.resume(null)
-                }
+            openedDevice = suspendCancellableCoroutine { cont ->
+                val settled = AtomicBoolean(false)
+                manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                    override fun onOpened(camera: CameraDevice) {
+                        if (settled.compareAndSet(false, true)) cont.resume(camera)
+                        else camera.close()
+                    }
 
-                override fun onError(camera: CameraDevice, error: Int) {
-                    Log.e(TAG, "openCamera error=$error")
-                    camera.close()
-                    if (settled.compareAndSet(false, true)) cont.resume(null)
-                }
-            }, cameraHandler)
-        }.also { opened.complete(it != null) } ?: error("could not open camera $cameraId")
+                    override fun onDisconnected(camera: CameraDevice) {
+                        camera.close()
+                        // Only the first callback answers the open; afterwards
+                        // this is the framework reclaiming a live camera, which
+                        // has to be unwound or the stale handle blocks reopening.
+                        if (settled.compareAndSet(false, true)) cont.resume(null)
+                        else handleDeviceLost(camera, "camera disconnected")
+                    }
+
+                    override fun onError(camera: CameraDevice, error: Int) {
+                        Log.e(TAG, "camera error=$error")
+                        camera.close()
+                        if (settled.compareAndSet(false, true)) cont.resume(null)
+                        else handleDeviceLost(camera, "camera error $error")
+                    }
+                }, cameraHandler)
+            }
+            device = openedDevice
+        } finally {
+            // Completed on every path, including a synchronous throw from
+            // openCamera when another app holds the device — otherwise
+            // startSession would sit on this deferred until it timed out.
+            opened.complete(openedDevice != null)
+        }
+
+        if (openedDevice == null) error("could not open camera $cameraId")
+    }
+
+    private fun handleDeviceLost(camera: CameraDevice, reason: String) {
+        if (device !== camera) return
+        Log.w(TAG, "device lost: $reason")
+        device = null
+        runCatching { session?.close() }
+        session = null
+        closeReaders()
+        streamPlan = null
+        liveResult.value = null
+        opened = CompletableDeferred()
+        onDeviceLost?.invoke(reason)
     }
 
     /** True while a CameraDevice is held open by this controller. */
@@ -228,6 +270,10 @@ class Camera2Controller(context: Context) {
 
         var lastError: String? = null
         for (plan in candidatePlans(capabilities)) {
+            if (device !== dev) {
+                closeReaders()
+                throw CameraClosedException("camera closed while configuring")
+            }
             closeReaders()
             runCatching { session?.close() }
             session = null
@@ -318,6 +364,7 @@ class Camera2Controller(context: Context) {
         }
 
         closeReaders()
+        if (device !== dev) throw CameraClosedException("camera closed while configuring")
         error("no stream combination accepted by HAL (last=$lastError)")
     }
 
@@ -400,13 +447,20 @@ class Camera2Controller(context: Context) {
         // repeating request first, so the new region is what the trigger acts on
         startPreview()
 
-        val builder = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-        previewSurface?.let { builder.addTarget(it) }
-        builder.applyControls(controls, capabilities, DeviceProfile.PREVIEW_EXPOSURE_CAP_NS)
-        builder.applyRegions()
-        builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
-        runCatching { s.capture(builder.build(), previewCallback, cameraHandler) }
-            .onFailure { Log.e(TAG, "AF trigger failed", it) }
+        fun trigger(value: Int) = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            previewSurface?.let { addTarget(it) }
+            applyControls(controls, capabilities, DeviceProfile.PREVIEW_EXPOSURE_CAP_NS)
+            applyRegions()
+            set(CaptureRequest.CONTROL_AF_TRIGGER, value)
+        }.build()
+
+        runCatching {
+            // Several HALs ignore a START that arrives while the previous AF
+            // cycle is still active, which is why a second tap would appear to
+            // do nothing. Cancel first, then trigger.
+            s.capture(trigger(CameraMetadata.CONTROL_AF_TRIGGER_CANCEL), null, cameraHandler)
+            s.capture(trigger(CameraMetadata.CONTROL_AF_TRIGGER_START), previewCallback, cameraHandler)
+        }.onFailure { Log.e(TAG, "AF trigger failed", it) }
     }
 
     /** Back to full-frame continuous AF. */

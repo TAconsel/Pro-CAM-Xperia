@@ -63,18 +63,6 @@ import com.procam.vm.CameraViewModel
 import com.procam.vm.ScrubTarget
 import com.procam.vm.ShootMode
 
-/**
- * The textbook (SENSOR_ORIENTATION - displayRotation) term lands a quarter turn
- * short of upright on this device — measured by shooting a JPEG and comparing
- * it against the viewfinder in the same session, with displayRotation logged as
- * 90 and SENSOR_ORIENTATION as 90.
- *
- * The app is landscape-only, so this is only claimed for ROTATION_90/270, where
- * a constant correction and a sign-flipped display term give the same answer.
- * Tapping the lens block still cycles a manual override on top.
- */
-private const val PREVIEW_ROTATION_CORRECTION = 90
-
 /** Tint in the usual camera notation: G = green shift, M = magenta shift. */
 private fun tintLabel(steps: Int): String = when {
     steps == 0 -> "0"
@@ -145,23 +133,26 @@ fun CameraScreen(
             ui.opening -> CenterText("OPENING CAMERA…")
             else -> Row(Modifier.fillMaxSize()) {
                 LeftRail(
-                    vm,
-                    ui.mode,
-                    ui.caps?.focalLengthMm ?: 0f,
-                    ui.previewRotationOffset,
-                    onOpenDiagnostics,
+                    vm = vm,
+                    mode = ui.mode,
+                    focalMm = ui.caps?.focalLengthMm ?: 0f,
+                    rotationOffset = ui.previewRotationOffset,
+                    cameraId = ui.caps?.cameraId ?: "-",
+                    cameraCount = ui.cameras.size,
+                    onOpenDiagnostics = onOpenDiagnostics,
                 )
 
                 val caps = ui.caps
                 val previewRotation = if (caps == null) {
                     0
                 } else {
+                    // Documented relationship between the sensor mounting angle
+                    // and the window. Any device that disagrees is corrected by
+                    // the per-model offset rather than by bending this formula.
                     val b = if (caps.facingBack) {
-                        (caps.sensorOrientation - displayDegrees +
-                            PREVIEW_ROTATION_CORRECTION + 360) % 360
+                        (caps.sensorOrientation - displayDegrees + 360) % 360
                     } else {
-                        (caps.sensorOrientation + displayDegrees +
-                            PREVIEW_ROTATION_CORRECTION) % 360
+                        (caps.sensorOrientation + displayDegrees) % 360
                     }
                     (b + ui.previewRotationOffset + 360) % 360
                 }
@@ -287,6 +278,8 @@ private fun LeftRail(
     mode: ShootMode,
     focalMm: Float,
     rotationOffset: Int,
+    cameraId: String,
+    cameraCount: Int,
     onOpenDiagnostics: () -> Unit,
 ) {
     Column(
@@ -304,6 +297,13 @@ private fun LeftRail(
                 ProTheme.TextSecondary,
                 10.sp,
                 Modifier.clickable { onOpenDiagnostics() }.padding(6.dp),
+            )
+            Spacer(Modifier.height(4.dp))
+            Text2(
+                "CAM $cameraId",
+                if (cameraCount > 1) ProTheme.Accent else ProTheme.TextDim,
+                10.sp,
+                Modifier.clickable(enabled = cameraCount > 1) { vm.switchCamera() }.padding(6.dp),
             )
         }
 
