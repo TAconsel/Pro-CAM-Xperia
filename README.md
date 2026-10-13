@@ -59,14 +59,15 @@ The diagnostics screen that produces this is in the app (`DIAG`, top-left).
 ## Build
 
 Requires JDK 17+ (Android Studio's bundled JBR works) and Android SDK
-platform 36 / build-tools 36.
+platform 36 / build-tools 36. Point `local.properties` at your SDK, or set
+`ANDROID_HOME`.
 
 ```bash
-gradle assembleDebug
+./gradlew assembleDebug
 ```
 
-> There is no Gradle wrapper committed yet, so you need Gradle **8.14.5**
-> on your `PATH`. `gradle wrapper` will generate one if you prefer.
+The wrapper pins Gradle **8.14.5** and fetches it on first run, so nothing has
+to be installed beyond a JDK and the Android SDK.
 
 Toolchain is pinned in `gradle/libs.versions.toml`: AGP 8.13.2, Kotlin 2.2.21,
 Compose 1.9.5, `compileSdk`/`targetSdk` 36, `minSdk` 30. AndroidX is held at the

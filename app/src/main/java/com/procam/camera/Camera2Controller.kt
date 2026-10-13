@@ -166,6 +166,9 @@ class Camera2Controller(context: Context) {
         }.also { opened.complete(it != null) } ?: error("could not open camera $cameraId")
     }
 
+    /** True while a CameraDevice is held open by this controller. */
+    fun isOpen(): Boolean = device != null
+
     fun close() {
         runCatching { session?.stopRepeating() }
         runCatching { session?.close() }

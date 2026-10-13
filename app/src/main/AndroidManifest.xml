@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Detent feedback on the adjustment ruler. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Only used when GPS tagging is switched on; requested at that moment. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />

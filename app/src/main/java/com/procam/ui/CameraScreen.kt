@@ -32,7 +32,9 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -44,6 +46,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.procam.camera.ControlMode
 import com.procam.camera.FlashMode
 import com.procam.camera.IsoScale
@@ -100,6 +105,32 @@ fun CameraScreen(
     }
 
     val context = LocalContext.current
+
+    // GLSurfaceView will not survive a trip to another app unless the host
+    // forwards these, and the camera must be handed back while we are away so
+    // the framework can give it to whoever is in front.
+    var glView by remember { mutableStateOf<CameraGLSurfaceView?>(null) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    glView?.onResume()
+                    vm.onEnterForeground()
+                }
+
+                Lifecycle.Event.ON_PAUSE -> {
+                    glView?.onPause()
+                    vm.onEnterBackground()
+                }
+
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     val levelSensor = remember { LevelSensor(context) }
     val level by levelSensor.state.collectAsState()
     levelSensor.displayRotation = surfaceRotation
@@ -168,6 +199,7 @@ fun CameraScreen(
                             factory = { ctx ->
                                 CameraGLSurfaceView(ctx).apply {
                                     init(caps.previewSize) { st -> vm.onSurfaceTextureReady(st) }
+                                    glView = this
                                 }
                             },
                             update = { v ->
@@ -179,6 +211,7 @@ fun CameraScreen(
                             // SurfaceTexture keeps a camera-facing buffer queue
                             // alive across a trip to the diagnostics screen.
                             onRelease = { v ->
+                                if (glView === v) glView = null
                                 runCatching { v.previewRenderer.releaseSurfaceTexture() }
                             },
                         )

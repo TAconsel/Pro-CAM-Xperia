@@ -104,6 +104,8 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     private val mrStore = MemoryRecallStore(app)
     private var previewSurface: Surface? = null
+    private var openJob: kotlinx.coroutines.Job? = null
+    private var sessionJob: kotlinx.coroutines.Job? = null
     private var lastServoAt = 0L
 
     init {
@@ -133,8 +135,8 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------------
 
     fun openCamera() {
-        if (_ui.value.caps != null) return
-        viewModelScope.launch {
+        if (controller.isOpen() || openJob?.isActive == true) return
+        openJob = viewModelScope.launch {
             try {
                 val cameras = controller.availableCameras()
                 val id = controller.bestCameraId()
@@ -152,17 +154,31 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Called every time the GL layer hands over a SurfaceTexture — which is not
+     * only once. Backgrounding the app can tear down the EGL context, and the
+     * texture that comes back afterwards is a different object; the previous
+     * one is dead. Ignoring the new one, as this used to, left the camera
+     * rendering into a surface nobody was showing, which is exactly what a
+     * frozen viewfinder after an app switch looks like.
+     */
     fun onSurfaceTextureReady(st: SurfaceTexture) {
-        if (previewSurface != null) return
         val surface = Surface(st)
+        if (previewSurface !== surface) previewSurface?.release()
         previewSurface = surface
-        viewModelScope.launch {
+        restartSession(surface)
+    }
+
+    private fun restartSession(surface: Surface) {
+        sessionJob?.cancel()
+        sessionJob = viewModelScope.launch {
             try {
                 val plan = controller.startSession(surface)
                 histogram.enabled = plan.hasHistogram
                 _ui.value = _ui.value.copy(
                     ready = true,
                     plan = plan,
+                    fatal = null,
                     notice = if (!plan.hasHistogram) {
                         "HAL rejected the YUV analysis stream — histogram off (${plan.label})"
                     } else if (!plan.raw) {
@@ -171,11 +187,36 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                         null
                     },
                 )
+            } catch (t: kotlinx.coroutines.CancellationException) {
+                throw t
             } catch (t: Throwable) {
                 Log.e(TAG, "startSession failed", t)
-                _ui.value = _ui.value.copy(fatal = t.message ?: "session failed")
+                _ui.value = _ui.value.copy(ready = false, fatal = t.message ?: "session failed")
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // foreground / background
+    //
+    // The camera is a shared, exclusive device: holding it open while another
+    // app is in front is both rude and unreliable, since the framework can
+    // revoke it at any moment and hand back a disconnected CameraDevice.
+    // ------------------------------------------------------------------
+
+    fun onEnterBackground() {
+        sessionJob?.cancel(); sessionJob = null
+        openJob?.cancel(); openJob = null
+        controller.close()
+        histogram.reset()
+        _ui.value = _ui.value.copy(ready = false, busy = false, fatal = null)
+    }
+
+    fun onEnterForeground() {
+        openCamera()
+        // If the EGL context survived, no new SurfaceTexture is coming and the
+        // existing surface has to be re-attached by hand.
+        previewSurface?.let { restartSession(it) }
     }
 
     fun closeCamera() {

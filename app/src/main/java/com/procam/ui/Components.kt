@@ -57,10 +57,9 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -181,9 +180,10 @@ fun <T> ValueRuler(
     modifier: Modifier = Modifier,
     majorEvery: Int = 5,
 ) {
-    val haptics = LocalHapticFeedback.current
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val haptic = remember(context) { HapticEngine(context) }
 
     // 22.dp keeps roughly seven detents either side of the index mark inside
     // the deck's width, which is what makes the major-tick labels land on
@@ -264,11 +264,12 @@ fun <T> ValueRuler(
                             if (next !in 0..lastIdx) {
                                 // rubber-band at the ends instead of running away
                                 residual = residual.coerceIn(-stepPx * 0.6f, stepPx * 0.6f)
+                                haptic.endStop()
                                 break
                             }
                             residual -= dir * stepPx
                             current = next
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            haptic.detent(major = next % majorEvery == 0)
                             onChange(next)
                         }
                     }

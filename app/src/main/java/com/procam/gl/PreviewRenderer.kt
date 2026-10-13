@@ -167,6 +167,20 @@ class PreviewRenderer(
     )
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        // onSurfaceCreated runs again whenever the EGL context is rebuilt, e.g.
+        // after the app has been in the background. Anything from the previous
+        // context is already invalid, but the handles would otherwise be
+        // overwritten and the SurfaceTexture leaked.
+        releaseSurfaceTexture()
+        if (program != 0) {
+            runCatching { GLES20.glDeleteProgram(program) }
+            program = 0
+        }
+        if (textureId != 0) {
+            runCatching { GLES20.glDeleteTextures(1, intArrayOf(textureId), 0) }
+            textureId = 0
+        }
+
         program = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER)
         aPosition = GLES20.glGetAttribLocation(program, "aPosition")
         aTexCoord = GLES20.glGetAttribLocation(program, "aTexCoord")
@@ -327,6 +341,9 @@ class CameraGLSurfaceView(context: Context) : GLSurfaceView(context) {
 
     fun init(bufferSize: Size, onSurfaceTextureReady: (SurfaceTexture) -> Unit) {
         setEGLContextClientVersion(2)
+        // Where the GPU allows it this keeps the context across a pause, so
+        // returning to the app does not have to rebuild shaders and textures.
+        preserveEGLContextOnPause = true
         previewRenderer = PreviewRenderer(
             bufferSize = bufferSize,
             onSurfaceTextureReady = onSurfaceTextureReady,
